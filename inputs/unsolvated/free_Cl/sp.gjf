@@ -1,0 +1,10 @@
+%NProcShared=2
+%Mem=2GB
+%Chk=sp.chk
+#p PBE1PBE/6-311+G(d,p) SP EmpiricalDispersion=GD3BJ SCF=(XQC,Tight) Integral=UltraFine NoSymm
+
+free_Cl__unsolvated | sp
+
+-1 1
+Cl  0.0000000000  0.0000000000  0.0000000000
+

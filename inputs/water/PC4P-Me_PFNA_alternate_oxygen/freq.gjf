@@ -1,0 +1,6 @@
+%NProcShared=8
+%Mem=48GB
+%OldChk=opt.chk
+%Chk=freq.chk
+#p PBEPBE/6-31+G(d,p) Freq Geom=AllCheck Guess=Read EmpiricalDispersion=GD3BJ SCF=(XQC,Tight) Integral=UltraFine NoSymm SCRF=(SMD,Solvent=Water)
+

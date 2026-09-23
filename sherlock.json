@@ -1,0 +1,8 @@
+{
+  "modules": ["chemistry", "gaussian/g16.B01"],
+  "partition": "normal",
+  "account": "",
+  "qos": "",
+  "max_parallel": 4,
+  "notes": "Version listed by Sherlock; verify module access in preflight. Empty account/qos uses your authorized defaults. Resources are pilot estimates, not benchmarked runtimes."
+}

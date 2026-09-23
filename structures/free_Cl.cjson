@@ -1,0 +1,34 @@
+{
+  "chemicalJson": 1,
+  "name": "free_Cl",
+  "formula": "Cl-",
+  "properties": {
+    "totalCharge": -1,
+    "totalSpinMultiplicity": 1,
+    "geometryStatus": "Unoptimized DFT starting geometry",
+    "source": "Monatomic anion; single point only"
+  },
+  "atoms": {
+    "elements": {
+      "number": [
+        17
+      ]
+    },
+    "formalCharges": [
+      -1
+    ],
+    "coords": {
+      "3d": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "bonds": {
+    "connections": {
+      "index": []
+    },
+    "order": []
+  }
+}

@@ -1,0 +1,6 @@
+%NProcShared=8
+%Mem=48GB
+%OldChk=freq.chk
+%Chk=sp.chk
+#p PBE1PBE/6-311+G(d,p) SP EmpiricalDispersion=GD3BJ SCF=(XQC,Tight) Integral=UltraFine NoSymm SCRF=(SMD,Solvent=Water) Geom=AllCheck Guess=Read
+

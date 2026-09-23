@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.ruff_cache/
+work/
+.venv/
+*.chk
+*.fchk
+*.rwf
+*.log
+results/

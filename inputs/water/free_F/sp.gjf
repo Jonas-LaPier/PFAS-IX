@@ -1,0 +1,10 @@
+%NProcShared=2
+%Mem=2GB
+%Chk=sp.chk
+#p PBE1PBE/6-311+G(d,p) SP EmpiricalDispersion=GD3BJ SCF=(XQC,Tight) Integral=UltraFine NoSymm SCRF=(SMD,Solvent=Water)
+
+free_F__water | sp
+
+-1 1
+F   0.0000000000  0.0000000000  0.0000000000
+
