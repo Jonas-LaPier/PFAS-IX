@@ -75,6 +75,6 @@
   "interpretation": "Local single-PFAS counterion exchange; counterion fractions unknown; no bulk capacity or transport prediction",
   "workflows": 350,
   "stages": 1078,
-  "queue_order": "Within each resource group: water before unsolvated; references before complexes; PFBA, PFOA, PFNA, PFOS, PFPeA, PFHpA; workers atomically claim the next job. Resource groups advance independently; completion order is not guaranteed.",
+  "queue_order": "Within each resource group: all salt/ion references and PFBA/PFOA/PFNA first, water then unsolvated; PFOS next, water then unsolvated; PFPeA/PFHpA last, water then unsolvated. Within each block/environment, references precede complexes. Workers atomically claim the next job. Resource groups advance independently; completion order is not guaranteed.",
   "method_checks": "32 aqueous M06-2X single points: A400 PFBA/PFOS and Cl/F references; PC4P PFBA and Cl references; PC4P-Me PFBA at both sites with retained I and ClI/II references; both free PFBA/PFOS conformers and free Cl/I/F."
 }

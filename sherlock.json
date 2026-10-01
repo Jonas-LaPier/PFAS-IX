@@ -1,8 +1,8 @@
 {
   "group_parallel": {
     "ions": 1,
-    "small": 2,
-    "large": 5
+    "small": 7,
+    "large": 56
   },
   "group_hours": {
     "ions": 2,
@@ -19,7 +19,7 @@
   "partition": "serc",
   "account": "wamitch",
   "qos": "normal",
-  "max_parallel": 8,
+  "max_parallel": 64,
   "temperature_k": 298.15,
   "entropy_cutoff_cm": 100.0,
   "gaussian_revision": "B.01",

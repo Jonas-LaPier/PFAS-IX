@@ -87,7 +87,7 @@ def validate(root=ROOT, checksums=True):
             "chemistry",
             "gaussian/g16.B01",
         ]
-        assert cfg["partition"] and 1 <= int(cfg["max_parallel"]) <= 8
+        assert cfg["partition"] and 1 <= int(cfg["max_parallel"]) <= 64
         assert cfg["temperature_k"] == 298.15 and cfg["entropy_cutoff_cm"] == 100
         assert set(cfg["group_parallel"]) == {"ions", "small", "large"}
         assert all(
