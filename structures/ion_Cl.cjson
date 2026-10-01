@@ -1,0 +1,43 @@
+{
+  "chemicalJson": 1,
+  "name": "ion_Cl",
+  "formula": "Cl-",
+  "properties": {
+    "totalCharge": -1,
+    "totalSpinMultiplicity": 1,
+    "geometryStatus": "Unoptimized DFT starting geometry",
+    "kind": "ion",
+    "resin": "",
+    "pfas": "",
+    "state": "Cl",
+    "site": "",
+    "spectator": "",
+    "conformer": "",
+    "pose": "",
+    "source": "DFT Run 2 molecular graph",
+    "preparation": "ETKDGv3; converged MMFF94s isolated fragments; 10 kcal/mol energy window and heavy-atom diversity; clash-screened placement"
+  },
+  "atoms": {
+    "elements": {
+      "number": [
+        17
+      ]
+    },
+    "formalCharges": [
+      -1
+    ],
+    "coords": {
+      "3d": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "bonds": {
+    "connections": {
+      "index": []
+    },
+    "order": []
+  }
+}

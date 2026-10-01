@@ -1,24 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=pfas_run2
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=40G
-#SBATCH --time=48:00:00
-#SBATCH --partition=normal
-
 set -euo pipefail
-project_root=${1:?Package directory is required}
-jobs_file=${2:?Job-list file is required}
-config_file=${3:?Configuration snapshot is required}
+project_root=${1:?Package snapshot is required}
+jobs_file=${2:?Job list is required}
+results_root=${3:?Results directory is required}
 cd "$project_root"
-
-module_names=$(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["modules"]))' "$config_file")
+export PYTHONDONTWRITEBYTECODE=1
+receipt="$(dirname "$jobs_file")/receipt.json"
+job="array_task_${SLURM_ARRAY_TASK_ID}"
+trap 'python3 scripts/health.py "$receipt" "$job" --failure "Batch setup failed" || true' ERR
+module load devel python/3.12.1
+job=$(python3 scripts/health.py "$receipt" "$SLURM_ARRAY_TASK_ID" --claim)
+python3 scripts/health.py "$receipt" "$job"
+python3 scripts/validate.py
 while IFS= read -r name; do
     module load "$name"
-done <<< "$module_names"
-export DFT_GAUSSIAN_MODULE
-DFT_GAUSSIAN_MODULE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["modules"][-1])' "$config_file")
-
-job=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$jobs_file")
-python3 scripts/run_job.py "$job" --receipt "$(dirname "$jobs_file")/receipt.json"
+done < <(python3 -c 'import json; print("\n".join(json.load(open("sherlock.json"))["modules"]))')
+command -v g16
+command -v formchk
+export DFT_GAUSSIAN_MODULE=gaussian/g16.B01
+trap - ERR
+python3 scripts/run_job.py "$job" --receipt "$receipt" --results-root "$results_root"

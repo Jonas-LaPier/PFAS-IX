@@ -1,0 +1,80 @@
+{
+  "schema": 2,
+  "pfas": [
+    "PFBA",
+    "PFPeA",
+    "PFHpA",
+    "PFOA",
+    "PFNA",
+    "PFOS"
+  ],
+  "resins": [
+    "A400",
+    "PC4P",
+    "PC4P-Me",
+    "PCy3",
+    "PPh3"
+  ],
+  "counterion_states": {
+    "A400": [
+      "Cl",
+      "F"
+    ],
+    "PC4P": [
+      "Cl"
+    ],
+    "PCy3": [
+      "Cl"
+    ],
+    "PPh3": [
+      "Cl"
+    ],
+    "PC4P-Me": [
+      "ClCl",
+      "ClI",
+      "II"
+    ]
+  },
+  "environments": [
+    "water",
+    "unsolvated"
+  ],
+  "complex_starts": 3,
+  "counterion_starts": 2,
+  "free_conformers": 2,
+  "selection": "48 ETKDG candidates per isolated fragment; converged MMFF94s; 10 kcal/mol window; lowest-energy seed plus heavy-atom diversity; three host/guest/pose combinations; same starting coordinates in both environments",
+  "methods": {
+    "opt": {
+      "functional": "PBEPBE",
+      "basis": "def2-SVPD",
+      "dispersion": true
+    },
+    "freq": {
+      "functional": "PBEPBE",
+      "basis": "def2-SVPD",
+      "dispersion": true
+    },
+    "sp": {
+      "functional": "PBE1PBE",
+      "basis": "def2-TZVPD",
+      "dispersion": true
+    },
+    "method": {
+      "functional": "M062X",
+      "basis": "def2-TZVPD",
+      "dispersion": false
+    },
+    "basis": {
+      "functional": "PBE1PBE",
+      "basis": "def2-QZVPD",
+      "dispersion": true
+    }
+  },
+  "basis_source": "Basis Set Exchange 0.12; basis version 1",
+  "structure_source_sha256": "e27f7118f6862e03dafabc71b6e86705db174ccd28df6e682515dc0d59d431ee",
+  "interpretation": "Local single-PFAS counterion exchange; counterion fractions unknown; no bulk capacity or transport prediction",
+  "workflows": 350,
+  "stages": 1078,
+  "queue_order": "Within each resource group: water before unsolvated; references before complexes; PFBA, PFOA, PFNA, PFOS, PFPeA, PFHpA; workers atomically claim the next job. Resource groups advance independently; completion order is not guaranteed.",
+  "method_checks": "32 aqueous M06-2X single points: A400 PFBA/PFOS and Cl/F references; PC4P PFBA and Cl references; PC4P-Me PFBA at both sites with retained I and ClI/II references; both free PFBA/PFOS conformers and free Cl/I/F."
+}

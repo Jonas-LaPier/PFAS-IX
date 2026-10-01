@@ -51,7 +51,13 @@ def check(path, stage, row):
     if text and ("SCF Done:" in tail or "Entering Gaussian" in tail):
         issues.append("Trailing unfinished calculation")
     energies = re.findall(r"SCF Done:\s+E\(([^)]+)\)\s*=\s*(" + NUMBER + ")", text)
-    method = "PBE1PBE" if stage == "sp" else "PBEPBE"
+    method = (
+        "M062X"
+        if stage == "method"
+        else "PBE1PBE"
+        if stage in ("sp", "basis")
+        else "PBEPBE"
+    )
     energy = None
     if not energies or method not in energies[-1][0].upper().replace("-", ""):
         issues.append("Missing expected " + method + " energy")
@@ -72,9 +78,38 @@ def check(path, stage, row):
     if stage == "freq":
         if len(frequencies) != 3 * int(row["atoms"]) - 6:
             issues.append("Incomplete vibrational spectrum")
-        if any(v < 0 for v in frequencies):
+        if any(not math.isfinite(v) for v in frequencies):
+            issues.append("Nonfinite vibrational frequency")
+        if any(v <= 0 for v in frequencies):
             issues.append("Imaginary frequencies; minimum not accepted")
+    route_blocks = re.findall(r"#[pPnN].*?(?=\n\s*-{5,})", text, re.DOTALL)
+    route = "".join("".join(route_blocks).upper().split())
+    if method + "/GEN" not in route:
+        issues.append("Expected functional/general basis route missing")
+    if ("GD3BJ" in route) != (stage != "method"):
+        issues.append("Dispersion route mismatch")
+    if ("SCRF=(SMD,SOLVENT=WATER)" in route) != (row["environment"] == "water"):
+        issues.append("Solvent route mismatch")
+    if "5D7F" not in route:
+        issues.append("Spherical basis convention mismatch")
+    if "INTEGRAL=ULTRAFINE" not in route:
+        issues.append("Integration grid mismatch")
+    if not re.search(r"(?:G16Rev|Revision\s+)B\.01", text):
+        issues.append("Gaussian revision differs from B.01")
+    thermal = re.findall(
+        r"Thermal correction to Gibbs Free Energy=\s*(" + NUMBER + ")", text
+    )
+    temperatures = re.findall(r"Temperature\s+(" + NUMBER + r")\s+Kelvin", text)
+    if stage == "freq":
+        if not thermal:
+            issues.append("Missing Gibbs thermal correction")
+        if not temperatures or abs(number(temperatures[-1]) - 298.15) > 0.01:
+            issues.append("Thermochemistry temperature mismatch")
     geometry = last_geometry(text)
+    if any(not math.isfinite(v) for atom in geometry for v in atom[1:]):
+        issues.append("Nonfinite geometry")
+    if thermal and not math.isfinite(number(thermal[-1])):
+        issues.append("Nonfinite thermal correction")
     if row["kind"] != "ion" and len(geometry) != int(row["atoms"]):
         issues.append("Final geometry missing or atom count mismatched")
     return {
@@ -84,13 +119,15 @@ def check(path, stage, row):
         "imaginary_frequencies": sum(v < 0 for v in frequencies),
         "lowest_frequency": min(frequencies) if frequencies else None,
         "geometry": geometry,
+        "frequencies_cm": frequencies,
+        "thermal_g_hartree": number(thermal[-1]) if thermal else None,
     }
 
 
 def main():
     p = argparse.ArgumentParser(description=None)
     p.add_argument("job")
-    p.add_argument("stage", choices=["opt", "freq", "sp"])
+    p.add_argument("stage", choices=["opt", "freq", "sp", "method", "basis"])
     p.add_argument("log")
     a = p.parse_args()
     row = next(r for r in manifest() if r["job"] == a.job)

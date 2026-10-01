@@ -1,8 +1,27 @@
 {
-  "modules": ["chemistry", "gaussian/g16.B01"],
-  "partition": "normal",
-  "account": "",
-  "qos": "",
-  "max_parallel": 4,
-  "notes": "Version listed by Sherlock; verify module access in preflight. Empty account/qos uses your authorized defaults. Resources are pilot estimates, not benchmarked runtimes."
+  "group_parallel": {
+    "ions": 1,
+    "small": 2,
+    "large": 5
+  },
+  "group_hours": {
+    "ions": 2,
+    "small": 48,
+    "large": 168
+  },
+  "failure_threshold": 2,
+  "modules": [
+    "devel",
+    "python/3.12.1",
+    "chemistry",
+    "gaussian/g16.B01"
+  ],
+  "partition": "serc",
+  "account": "wamitch",
+  "qos": "normal",
+  "max_parallel": 8,
+  "temperature_k": 298.15,
+  "entropy_cutoff_cm": 100.0,
+  "gaussian_revision": "B.01",
+  "backup_max_gb": 100
 }
