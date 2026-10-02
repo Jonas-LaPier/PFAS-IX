@@ -7,6 +7,106 @@ from pathlib import Path
 
 from common import config, write_json
 
+ACTIVE = {"PENDING", "CONFIGURING", "RUNNING", "COMPLETING", "SUSPENDED"}
+
+
+def queue_state():
+    result = subprocess.run(
+        [
+            "squeue",
+            "--array",
+            "--noheader",
+            "--user",
+            os.environ["USER"],
+            "--states=all",
+            "--format=%F|%A|%T",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    rows = []
+    for line in result.stdout.splitlines():
+        array, job, state = line.strip().split("|")
+        if not array.isdigit() or not job.isdigit():
+            raise ValueError("Unexpected scheduler identifiers")
+        rows.append({"array": array, "job": job, "state": state})
+    return rows
+
+
+def transition_limit(cfg, group, previous, current, queue):
+    active = [r for r in queue if r["state"] in ACTIVE]
+    available = cfg["max_parallel"] - sum(
+        r["array"] in previous.values() for r in active
+    )
+    if group == "small":
+        return min(cfg["group_parallel"]["small"], max(0, available))
+    reserve = (
+        cfg["group_parallel"]["small"]
+        if any(r["array"] == current.get("small") for r in active)
+        else 0
+    )
+    return max(0, available - reserve)
+
+
+def rebalance_transition(receipt_path, receipt):
+    folder = receipt_path.parent.parent
+    cfg = config()
+    with (folder / "rebalance.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (folder / "health.json").exists() and json.loads(
+            (folder / "health.json").read_text()
+        ).get("stopped"):
+            return
+        receipts = {
+            p.parent.name: json.loads(p.read_text())
+            for p in folder.glob("*/receipt.json")
+        }
+        if any(r.get("status") != "submitted" for r in receipts.values()):
+            return
+        current = {g: r["stdout"].strip().split(";")[0] for g, r in receipts.items()}
+        if not all(v.isdigit() for v in current.values()):
+            raise ValueError("Invalid recovery array identifiers")
+        queue = queue_state()
+        live = {r["array"] for r in queue if r["state"] in ACTIVE}
+        if not live.intersection(current.values()):
+            return
+        path = folder / "rebalance.json"
+        state = json.loads(path.read_text()) if path.exists() else {}
+        for group, identifier in current.items():
+            if identifier not in live:
+                continue
+            limit = transition_limit(
+                cfg, group, receipt["previous_arrays"], current, queue
+            )
+            if not 0 <= limit <= cfg["max_parallel"]:
+                raise ValueError("Invalid recovery concurrency budget")
+            if limit > state.get(group, 0):
+                subprocess.run(
+                    [
+                        "scontrol",
+                        "update",
+                        "JobId=" + identifier,
+                        "ArrayTaskThrottle=" + str(limit),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=15,
+                )
+                if group == "large" and not state.get("large_released"):
+                    subprocess.run(
+                        ["scontrol", "release", identifier],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=15,
+                    )
+                    state["large_released"] = True
+                state[group] = limit
+                write_json(path, state)
+
 
 def claim(receipt_path, task_id):
     receipt_path = Path(receipt_path)
@@ -61,6 +161,10 @@ def update(receipt_path, job, failure=None):
 
 def rebalance(receipt_path):
     receipt_path = Path(receipt_path)
+    receipt = json.loads(receipt_path.read_text())
+    if receipt.get("previous_arrays"):
+        rebalance_transition(receipt_path, receipt)
+        return
     if receipt_path.parent.name != "large":
         return
     folder = receipt_path.parent.parent

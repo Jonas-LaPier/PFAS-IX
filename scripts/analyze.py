@@ -91,6 +91,13 @@ def inspect_attempt(folder, row, root=ROOT):
         if log.exists() and meta.get("log_hashes", {}).get(stage) != sha256(log):
             result["issues"].append("Log checksum mismatch")
             result["valid"] = False
+        executed = meta.get("executed_input_hashes", {}).get(stage)
+        if executed and (
+            not (folder / (stage + ".gjf")).exists()
+            or sha256(folder / (stage + ".gjf")) != executed
+        ):
+            result["issues"].append("Executed input checksum mismatch")
+            result["valid"] = False
     if row["kind"] != "ion":
         for stage in stages(row):
             if (

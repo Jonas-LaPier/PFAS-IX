@@ -12,6 +12,7 @@ from backup import snapshot
 from check_log import check
 from common import ROOT, input_hashes, manifest, sha256, stages, write_json
 from health import rebalance, update
+from numerics import controls, failure_kind, geometry_restart
 
 
 def restart_input(source, checkpoint, dest, row):
@@ -162,6 +163,7 @@ def main():
                 ):
                     shutil.copy2(oldlog, log)
                     shutil.copy2(oldchk, checkpoint)
+                    shutil.copy2(old / source.name, dest / source.name)
                     reuse = True
                 if not reuse:
                     reusable = False
@@ -171,25 +173,76 @@ def main():
                     "Campaign stopped after repeated setup or parser failures"
                 )
             if stage == "opt" and old and not reuse and receipt.get("restart_opt"):
-                meta["optimization_restart"] = restart_input(
-                    source, old / "opt.chk", dest, row
-                )
+                previous_text = (old / "opt.log").read_text(errors="replace")
+                previous_failure = failure_kind(previous_text)
+                if previous_failure in ["scf", "pcm"]:
+                    meta["optimization_restart"] = geometry_restart(
+                        source, old / "opt.log", dest, row
+                    )
+                elif (old / "opt.chk").is_file():
+                    meta["optimization_restart"] = restart_input(
+                        source, old / "opt.chk", dest, row
+                    )
+                else:
+                    raise RuntimeError("Optimization checkpoint missing")
+            else:
+                previous_failure = None
             meta["current_stage"] = stage
             save()
             if reuse:
                 meta.setdefault("reused_stages", {})[stage] = str(old)
+                if stage in oldmeta.get("numerical_controls", {}):
+                    meta.setdefault("numerical_controls", {})[stage] = oldmeta[
+                        "numerical_controls"
+                    ][stage]
                 rc = 0
             else:
-                with (dest / source.name).open() as inp, log.open("w") as out:
-                    rc = subprocess.run(
-                        ["g16"],
-                        stdin=inp,
-                        stdout=out,
-                        stderr=subprocess.STDOUT,
-                        cwd=dest,
-                        env=env,
-                        check=False,
-                    ).returncode
+                meta.setdefault("numerical_controls", {})[stage] = controls(
+                    dest / source.name, stage, previous_failure
+                )
+                save()
+                while True:
+                    with (dest / source.name).open() as inp, log.open("w") as out:
+                        rc = subprocess.run(
+                            ["g16"],
+                            stdin=inp,
+                            stdout=out,
+                            stderr=subprocess.STDOUT,
+                            cwd=dest,
+                            env=env,
+                            check=False,
+                        ).returncode
+                    failed_kind = failure_kind(log.read_text(errors="replace"))
+                    if (
+                        stage != "opt"
+                        or check(log, stage, row)["valid"]
+                        or failed_kind not in ["scf", "pcm"]
+                        or previous_failure in ["scf", "pcm"]
+                    ):
+                        break
+                    history = {
+                        "failure": failed_kind,
+                        "log_sha256": sha256(log),
+                        "input_sha256": sha256(dest / source.name),
+                    }
+                    meta["optimization_recovery"] = history
+                    save()
+                    protect()
+                    for suffix in ["gjf", "log", "chk"]:
+                        original = dest / ("opt." + suffix)
+                        if original.exists():
+                            original.rename(dest / ("opt-before-recovery." + suffix))
+                    meta["optimization_restart"] = geometry_restart(
+                        source, dest / "opt-before-recovery.log", dest, row
+                    )
+                    previous_failure = failed_kind
+                    meta["numerical_controls"][stage] = controls(
+                        dest / source.name, stage, failed_kind
+                    )
+                    save()
+            meta.setdefault("executed_input_hashes", {})[stage] = sha256(
+                dest / source.name
+            )
             checked = check(log, stage, row)
             meta["stage_results"][stage] = {
                 k: v for k, v in checked.items() if k != "geometry"
