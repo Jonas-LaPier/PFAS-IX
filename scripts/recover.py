@@ -20,6 +20,48 @@ from submit import array_command
 from validate import validate
 
 
+def hold_originals(identifiers):
+    for identifier in identifiers:
+        result = subprocess.run(
+            ["scontrol", "hold", identifier],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.stdout:
+            print(result.stdout.strip())
+        if result.stderr:
+            print(result.stderr.strip())
+    result = subprocess.run(
+        [
+            "squeue",
+            "--array",
+            "--noheader",
+            "--user",
+            os.environ["USER"],
+            "--states=PENDING",
+            "--format=%F|%K|%Q",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    pending = {}
+    for line in result.stdout.splitlines():
+        array, task, priority = line.strip().split("|")
+        if array in identifiers and int(priority) != 0:
+            raise RuntimeError(
+                "An original pending task is not held; replacement is not safe"
+            )
+        if array in identifiers:
+            pending.setdefault(array, []).append(int(task))
+    return [
+        array + "_[" + ",".join(str(i) for i in sorted(indices)) + "]"
+        for array, indices in pending.items()
+    ]
+
+
 def select_rows(previous, queue):
     active = {
         r["job"]
@@ -125,16 +167,17 @@ def main():
             identifier for identifier in previous.values() if identifier in live
         ]
         if original_live:
-            subprocess.run(["scontrol", "hold", *original_live], check=True)
-            subprocess.run(
-                [
-                    "scancel",
-                    "--state=PENDING",
-                    "--user=" + os.environ["USER"],
-                    *original_live,
-                ],
-                check=True,
-            )
+            pending = hold_originals(original_live)
+            if pending:
+                subprocess.run(
+                    [
+                        "scancel",
+                        "--state=PENDING",
+                        "--user=" + os.environ["USER"],
+                        *pending,
+                    ],
+                    check=True,
+                )
         queue = queue_state()
         if any(
             r["array"] in previous.values() and r["state"] == "PENDING" for r in queue
