@@ -1093,7 +1093,7 @@
   "scripts/run_job.py": "9b3f1751004b1f7991d3ddae4dad41d25e0c9da60a29d1d5991a1f76d57822eb",
   "scripts/submit.py": "38e4ff015d53edec6803882d40f5e4173d21720d593fd072412cd9018ce4561f",
   "scripts/submit.sh": "a28d55345b28d5ce9d06d3435c816ef1439699b0ecd64cec9c892af22e49ec43",
-  "scripts/supervisor.py": "66ee867f37eb9c7660367c104af69b800a8e0c364b9e09b37070dac6ffbf6a4c",
+  "scripts/supervisor.py": "b30d136fab6fd49caf27bfddc535185d28e631e16f4d7ca30698a329456eccb6",
   "scripts/validate.py": "882fab6e617442e474984a7bb5ee1fb0cd8856f8284cde08e0829ede4ff630ec",
   "sherlock.json": "b7db1ca68e94ef24b552ccb1711f9b1916012a1a578e6063c59ccd0a00f5e2de",
   "structures/A400_Cl_c1_p1.cjson": "eb93d25cc6967711d381a8b47edf9a62d7ca213f0d043233591099510ce39b35",

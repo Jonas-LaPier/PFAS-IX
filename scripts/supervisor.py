@@ -13,18 +13,21 @@ class InterruptedCalculation(RuntimeError):
 
 def process_states(pgid):
     result = subprocess.run(
-        ["ps", "-eo", "pgid=,stat="],
+        ["ps", "-eo", "pgid,stat"],
         capture_output=True,
         text=True,
         check=True,
         timeout=10,
     )
+    lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
+    if not lines or lines[0] != ["PGID", "STAT"]:
+        raise RuntimeError("Unrecognized process list; quiescence cannot be verified")
+    if any(len(fields) != 2 or not fields[0].isdigit() for fields in lines[1:]):
+        raise RuntimeError("Incomplete process list; quiescence cannot be verified")
     return [
         fields[1]
-        for line in result.stdout.splitlines()
-        if len(fields := line.split()) == 2
-        and int(fields[0]) == pgid
-        and not fields[1].startswith("Z")
+        for fields in lines[1:]
+        if int(fields[0]) == pgid and not fields[1].startswith("Z")
     ]
 
 
