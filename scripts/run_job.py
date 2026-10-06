@@ -251,6 +251,7 @@ def main():
                         retry_allowed = False
                     if not retry_allowed:
                         break
+                    category = failure
                     meta["retry_used"] = True
                     meta["recovery_cause"] = failure
                     save()
@@ -261,7 +262,12 @@ def main():
                             path.rename(dest / (stage + "-before-recovery" + suffix))
                     if stage == "opt":
                         meta["optimization_restart"] = geometry_restart(
-                            source, dest / (stage + "-before-recovery.log"), dest, row
+                            source,
+                            dest / (stage + "-before-recovery.log"),
+                            dest,
+                            row,
+                            previous_log=old / "opt.log" if old else None,
+                            fallback_input=dest / (stage + "-before-recovery.gjf"),
                         )
                     else:
                         shutil.copy2(source, target)

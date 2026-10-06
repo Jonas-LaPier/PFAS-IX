@@ -118,16 +118,63 @@ def best_frame(text, row, root=ROOT):
     )
 
 
-def geometry_restart(source, log, dest, row, root=ROOT):
+def geometry_restart(
+    source, log, dest, row, root=ROOT, previous_log=None, fallback_input=None
+):
+    from provenance import geometry_issues, input_model
+
     text = log.read_text(errors="replace")
-    if not evaluated_frames(text):
-        if failure_kind(text) != "scf":
+    candidates = []
+    for rank, candidate in enumerate([previous_log, log]):
+        if candidate is None or not candidate.exists():
+            continue
+        try:
+            frame = best_frame(candidate.read_text(errors="replace"), row, root)
+        except RuntimeError:
+            continue
+        candidates.append((frame, candidate, rank))
+    selected_log = log
+    if not candidates:
+        if evaluated_frames(text):
+            raise RuntimeError(
+                "No structurally valid, fully evaluated restart geometry"
+            )
+        if failure_kind(text) != "scf" and not (
+            failure_kind(text) == "pcm" and fallback_input is not None
+        ):
             raise RuntimeError("No evaluated geometry available for recovery")
+        starting = fallback_input or source
+        if input_model(starting.read_text(), "opt") != input_model(
+            source.read_text(), "opt"
+        ):
+            raise RuntimeError("Starting input chemistry differs")
+        body = starting.read_text().split("\n\n", 2)[2].split("\n\n", 1)[0]
+        numbers = {symbol: number for number, symbol in SYMBOLS.items()}
+        atoms = [
+            [numbers[line.split()[0]], *map(float, line.split()[1:])]
+            for line in body.splitlines()[1:]
+        ]
+        if geometry_issues(atoms, row, root):
+            raise RuntimeError("Starting geometry requires structural review")
         target = dest / "opt.gjf"
-        target.write_text(source.read_text())
-        record = {"mode": "Original geometry; fresh wavefunction", "step": 0}
+        target.write_text(starting.read_text())
+        record = {
+            "mode": "Verified starting geometry; no new evaluated step",
+            "step": 0,
+            "starting_input": str(starting),
+            "starting_input_sha256": sha256(starting),
+        }
     else:
-        record = best_frame(text, row, root)
+        record, selected_log, _ = min(
+            candidates,
+            key=lambda item: (
+                item[0]["maximum_force"],
+                item[0]["rms_force"],
+                item[0]["energy_hartree"],
+                -item[2],
+                -item[0]["step"],
+            ),
+        )
         prefix, title, body = source.read_text().split("\n\n", 2)
         basis = body.split("\n\n", 1)[1]
         coordinates = "\n".join(
@@ -148,7 +195,11 @@ def geometry_restart(source, log, dest, row, root=ROOT):
         )
         record["mode"] = "Best evaluated geometry; fresh Hessian and wavefunction"
     record.update(
-        source_log=str(log), source_log_sha256=sha256(log), input_sha256=sha256(target)
+        source_log=str(selected_log),
+        source_log_sha256=sha256(selected_log),
+        failed_log=str(log),
+        failed_log_sha256=sha256(log),
+        input_sha256=sha256(target),
     )
     write_json(dest / "recovery-geometry.json", record)
     return record
