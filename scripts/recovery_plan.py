@@ -21,7 +21,7 @@ from common import (
 )
 from health import ACTIVE, queue_state
 from numerics import PROFILE
-from provenance import geometry_issues, source_audit
+from provenance import geometry_issues, input_model, source_audit
 from submit import array_command
 from validate import validate
 
@@ -66,7 +66,34 @@ def load_plan(path):
     return plan, rows
 
 
+def replacement_records(plan_path, phase):
+    path = phase_paths(plan_path, phase).with_name(
+        phase_paths(plan_path, phase).stem + "-replacements.json"
+    )
+    return json.loads(path.read_text())["replacements"] if path.exists() else {}
+
+
 def record_attempt(record, job, results):
+    if job in record.get("replacements", {}):
+        replacement = record["replacements"][job]
+        path = Path(replacement["record"])
+        if sha256(path) != replacement["record_sha256"]:
+            raise RuntimeError("Replacement record changed")
+        newer = json.loads(path.read_text())
+        if newer["plan_sha256"] != record["plan_sha256"] or newer["jobs"] != [job]:
+            raise RuntimeError("Replacement scope differs")
+        prior = Path(newer["replaces"])
+        if not prior.is_relative_to(results / job):
+            raise RuntimeError("Replacement source outside workflow")
+        if sha256(prior / "run.json") != newer["replaces_meta_sha256"]:
+            raise RuntimeError("Replaced attempt changed")
+        old = json.loads((prior / "run.json").read_text())
+        if (
+            old["status"] not in ("failed", "interrupted")
+            or old["package_hashes"] != record["package_hashes"]
+        ):
+            raise RuntimeError("Replacement source was not the failed validation")
+        return record_attempt(newer, job, results)
     candidates = []
     for p in (results / job).glob("*/run.json"):
         meta = json.loads(p.read_text())
@@ -110,6 +137,12 @@ def gate(record, rows, results, opt_only=False):
                 raise RuntimeError(job + ": executed input provenance differs")
             if meta["log_hashes"].get(stage) != sha256(log):
                 raise RuntimeError(job + ": stage log changed")
+            if input_model(
+                (folder / (stage + ".gjf")).read_text(), stage
+            ) != input_model(
+                (ROOT / rows[job]["input_dir"] / (stage + ".gjf")).read_text(), stage
+            ):
+                raise RuntimeError(job + ": executed chemistry differs")
             required += [
                 "attempt/" + stage + suffix for suffix in (".log", ".chk", ".gjf")
             ]
@@ -149,9 +182,11 @@ def submit_plan(path, phase, execute=False):
     results = Path(plan["runtime_root"]) / "results"
     if phase in ("warmup", "full"):
         previous = json.loads(phase_paths(path, "validation").read_text())
+        previous["replacements"] = replacement_records(path, "validation")
         gate(previous, rows, results)
     if phase == "full":
         previous = json.loads(phase_paths(path, "warmup").read_text())
+        previous["replacements"] = replacement_records(path, "warmup")
         gate(previous, rows, results, opt_only=True)
     for job in phase_jobs + plan["completed"]:
         if job in plan["sources"]:
@@ -330,6 +365,11 @@ def guard_allocations(receipt_path):
         path = phase_paths(plan_path, name)
         if path.exists():
             arrays.update(json.loads(path.read_text())["arrays"].values())
+        for replacement in replacement_records(plan_path, name).values():
+            record_path = Path(replacement["record"])
+            if sha256(record_path) != replacement["record_sha256"]:
+                raise RuntimeError("Replacement allocation record changed")
+            arrays.update(json.loads(record_path.read_text())["arrays"].values())
     output = subprocess.check_output(
         ["squeue", "--array", "-h", "-u", os.environ["USER"], "-o", "%F|%T|%C|%j"],
         text=True,

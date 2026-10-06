@@ -18,7 +18,9 @@ def algorithm(row):
     return "YQC" if row.get("resin") not in (None, "", "A400") else "XQC"
 
 
-def controls(path, stage, recovery=None, row=None, remaining=STEP_LIMIT):
+def controls(
+    path, stage, recovery=None, row=None, remaining=STEP_LIMIT, pcm_solver=False
+):
     text = path.read_text()
     selected = algorithm(row or {})
     if recovery == "scf":
@@ -41,10 +43,13 @@ def controls(path, stage, recovery=None, row=None, remaining=STEP_LIMIT):
         )
         if count != 1:
             raise RuntimeError("Expected one optimization directive")
+    if recovery == "pcm" or pcm_solver:
+        text = iterative_pcm(text)
     path.write_text(text)
     return {
         "profile": PROFILE,
         "scf": scf,
+        "pcm_solver": "iterative" if "Iterative QConv=VeryTight" in text else "default",
         "optimization_max_steps": remaining if stage == "opt" else None,
         "initial_trust_radius": step / 100 if stage == "opt" else None,
         "input_sha256": sha256(path),
@@ -205,7 +210,43 @@ def geometry_restart(
     return record
 
 
+def iterative_pcm(text):
+    normalized = normalize_pcm(text)
+    if "SCRF=(SMD,Solvent=Water)" not in normalized:
+        raise ValueError("Iterative PCM requires the existing SMD water model")
+    return (
+        normalized.replace(
+            "SCRF=(SMD,Solvent=Water)", "SCRF=(SMD,Solvent=Water,Read)"
+        ).rstrip()
+        + "\n\nIterative QConv=VeryTight\n\n"
+    )
+
+
+def normalize_pcm(text):
+    prefix, rest = text.split("\n\n", 1)
+    routes = re.findall(r"SCRF=\([^)]*\)", prefix, re.I)
+    if not routes:
+        return text
+    if len(routes) != 1:
+        raise ValueError("Expected one solvent directive")
+    route = routes[0]
+    if "READ" not in route.upper().removeprefix("SCRF=(").removesuffix(")").split(","):
+        return text
+    if route.upper() != "SCRF=(SMD,SOLVENT=WATER,READ)":
+        raise ValueError("Unapproved solvent model or options")
+    sections = rest.rstrip().rsplit("\n\n", 1)
+    if len(sections) != 2 or sections[1] != "Iterative QConv=VeryTight":
+        raise ValueError("Unapproved PCM parameters")
+    return (
+        prefix.replace(route, "SCRF=(SMD,Solvent=Water)")
+        + "\n\n"
+        + sections[0]
+        + "\n\n"
+    )
+
+
 def scientific_input(text):
+    text = normalize_pcm(text)
     prefix, rest = text.split("\n\n", 1)
     body = rest if "GEOM=ALLCHECK" in prefix.upper() else rest.split("\n\n", 1)[1]
     for directive in re.findall(r"^%[^\n]+", prefix, flags=re.MULTILINE):

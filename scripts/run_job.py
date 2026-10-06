@@ -21,7 +21,7 @@ from numerics import (
     geometry_restart,
     step_count,
 )
-from provenance import checkpoint_readable, geometry_issues, source_audit
+from provenance import checkpoint_readable, geometry_issues, input_model, source_audit
 from analyze import same_geometry
 from supervisor import Supervisor, InterruptedCalculation, telemetry
 
@@ -131,6 +131,35 @@ def main():
         if descriptor:
             meta["source"] = descriptor
             meta["audited_reusable_stages"] = reusable
+        continuation = receipt.get("continuations", {}).get(args.job)
+        if continuation:
+            prior = Path(continuation["attempt"])
+            if sha256(prior / "run.json") != continuation["meta_sha256"]:
+                raise RuntimeError("Continuation source changed")
+            previous = json.loads((prior / "run.json").read_text())
+            if (
+                previous["status"] not in ("failed", "interrupted")
+                or previous["job"] != args.job
+            ):
+                raise RuntimeError(
+                    "Continuation requires a terminal attempt of this workflow"
+                )
+            failed_log = prior / "opt-before-recovery.log"
+            evidence_path = Path(receipt["numerical_evidence"])
+            if (
+                previous["optimization_steps"] != 0
+                or len(previous["recovery_segments"]) != 1
+                or sha256(failed_log) != previous["recovery_segments"][0]["log_sha256"]
+                or failure_kind(failed_log.read_text(errors="replace")) != "pcm"
+                or sha256(evidence_path) != receipt["numerical_evidence_sha256"]
+                or json.loads(evidence_path.read_text())["status"] != "passed"
+            ):
+                raise RuntimeError("PCM continuation evidence differs")
+            meta["optimization_steps"] = previous["optimization_steps"]
+            meta["recovery_segments"] = previous["recovery_segments"]
+            meta["retry_used"] = True
+            meta["recovery_cause"] = "pcm"
+            meta["continuation"] = continuation
         optimized = None
         for stage in stages(row):
             source = ROOT / row["input_dir"] / (stage + ".gjf")
@@ -168,10 +197,26 @@ def main():
             if reuse:
                 meta.setdefault("reused_stages", {})[stage] = str(old)
             else:
-                recovery = None
+                recovery = "pcm" if continuation and stage == "opt" else None
                 while True:
                     remaining = STEP_LIMIT - meta["optimization_steps"]
-                    numerical = controls(target, stage, recovery, row, remaining)
+                    numerical = controls(
+                        target,
+                        stage,
+                        recovery,
+                        row,
+                        remaining,
+                        pcm_solver=receipt.get("pcm_solver", {}).get(args.job)
+                        == "iterative"
+                        or meta.get("recovery_cause") == "pcm",
+                    )
+                    if input_model(target.read_text(), stage) != input_model(
+                        source.read_text(), stage
+                    ):
+                        category = "provenance"
+                        raise RuntimeError(
+                            "Executed scientific model differs from frozen input"
+                        )
                     meta["numerical_controls"][stage] = numerical
                     meta["executed_input_hashes"][stage] = sha256(target)
                     save()

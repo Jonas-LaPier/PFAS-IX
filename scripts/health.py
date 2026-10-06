@@ -142,7 +142,7 @@ def claim(receipt_path, task_id):
 def hold_recovery(receipt):
     if not receipt.get("phase_record"):
         return []
-    from recovery_plan import phase_paths
+    from recovery_plan import phase_paths, replacement_records
 
     phase = json.loads(Path(receipt["phase_record"]).read_text())
     plan = Path(phase["plan"])
@@ -154,7 +154,12 @@ def hold_recovery(receipt):
         record = json.loads(path.read_text())
         if record["plan_sha256"] != receipt["recovery_plan"]:
             raise RuntimeError("Phase provenance differs during health stop")
-        for identifier in record["arrays"].values():
+        identifiers = list(record["arrays"].values())
+        for replacement in replacement_records(plan, name).values():
+            identifiers += list(
+                json.loads(Path(replacement["record"]).read_text())["arrays"].values()
+            )
+        for identifier in identifiers:
             if not identifier.isdigit():
                 raise RuntimeError("Invalid array identifier")
             result = subprocess.run(

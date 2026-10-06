@@ -113,7 +113,12 @@ def check(path, stage, row):
         issues.append("Expected functional/general basis route missing")
     if ("GD3BJ" in route) != (stage != "method"):
         issues.append("Dispersion route mismatch")
-    if ("SCRF=(SMD,SOLVENT=WATER)" in route) != (row["environment"] == "water"):
+    solvent = re.findall(r"SCRF=\([^)]*\)", route)
+    allowed_solvent = ["SCRF=(SMD,SOLVENT=WATER)", "SCRF=(SMD,SOLVENT=WATER,READ)"]
+    if row["environment"] == "water":
+        if len(solvent) != 1 or solvent[0] not in allowed_solvent:
+            issues.append("Solvent route mismatch")
+    elif solvent:
         issues.append("Solvent route mismatch")
     if "5D7F" not in route:
         issues.append("Spherical basis convention mismatch")
