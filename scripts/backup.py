@@ -2,6 +2,8 @@ import argparse
 import fcntl
 import json
 import os
+import re
+import subprocess
 import shutil
 import tempfile
 import time
@@ -27,6 +29,63 @@ def destination(root=ROOT):
     return target
 
 
+def quota_bytes(text):
+    match = re.search(
+        r"^\s*GROUP_HOME\s*\|\s*([0-9.]+)([KMGT]?B)\s*/\s*([0-9.]+)([KMGT]?B)",
+        text,
+        re.M,
+    )
+    if not match:
+        raise RuntimeError("Group quota could not be verified")
+    factors = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+    used = float(match[1]) * factors[match[2]]
+    limit = float(match[3]) * factors[match[4]]
+    return max(0, limit - used - factors[match[2]])
+
+
+def storage_status(root=ROOT, new_start=False):
+    target = destination(root)
+    target.mkdir(parents=True, exist_ok=True)
+    objects = target / "objects"
+    usage = (
+        sum(p.stat().st_size for p in objects.iterdir() if p.is_file())
+        if objects.exists()
+        else 0
+    )
+    cfg = config(root)
+    quota = subprocess.run(
+        ["sh_quota"], capture_output=True, text=True, check=True, timeout=30
+    )
+    free = min(quota_bytes(quota.stdout), shutil.disk_usage(target).free)
+    status = {
+        "used_bytes": usage,
+        "group_available_bytes": free,
+        "warning": usage >= cfg.get("backup_warn_gb", 80) * 1024**3,
+    }
+    if new_start and (
+        usage >= cfg.get("backup_stop_gb", 90) * 1024**3 or free < 2 * 1024**3
+    ):
+        raise RuntimeError("Backup capacity blocks new calculations")
+    return status
+
+
+def verify_snapshot(record, required=None):
+    record = Path(record)
+    data = json.loads(record.read_text())
+    objects = record.parents[3] / "objects"
+    for name, digest in data["files"].items():
+        if required is not None and name not in required:
+            continue
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or sha256(objects / digest) != digest
+        ):
+            raise RuntimeError("Stored backup checksum mismatch: " + name)
+    if required and not set(required) <= set(data["files"]):
+        raise RuntimeError("Backup manifest omits required outputs")
+    return data
+
+
 def snapshot(attempt, receipt, root=ROOT):
     target = destination(root)
     target.mkdir(parents=True, exist_ok=True)
@@ -49,6 +108,14 @@ def snapshot(attempt, receipt, root=ROOT):
         mapping = {name: sha256(p) for name, p in files.items()}
         usage = sum(p.stat().st_size for p in objects.iterdir() if p.is_file())
         limit = config(root)["backup_max_gb"] * 1024**3
+        available = storage_status(root)["group_available_bytes"]
+        needed = sum(
+            source.stat().st_size
+            for name, source in files.items()
+            if not (objects / mapping[name]).exists()
+        )
+        if usage + needed > limit or available < needed + 1024**3:
+            raise RuntimeError("Insufficient verified backup capacity")
         for name, source in files.items():
             saved = objects / mapping[name]
             if saved.exists():

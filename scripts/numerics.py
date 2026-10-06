@@ -1,35 +1,41 @@
-import json
+import hashlib
 import re
-import shutil
+import math
 
-from check_log import last_geometry
-from common import ROOT, sha256
+from check_log import NUMBER, last_geometry, number, terminal_failure
+from common import ROOT, sha256, write_json
 from validate import SYMBOLS, inspect_structure, structure
 
-
-def failure_kind(text):
-    if "Inv3 failed in PCMMkU" in text:
-        return "pcm"
-    if "No lower point found" in text or "Convergence failure" in text:
-        return "scf"
-    if "Number of steps exceeded" in text:
-        return "steps"
-    return None
+PROFILE = "internal-20261005"
+STEP_LIMIT = 300
 
 
-def controls(path, stage, recovery=None):
+def failure_kind(text, returncode=None):
+    return terminal_failure(text, returncode)
+
+
+def algorithm(row):
+    return "YQC" if row.get("resin") not in (None, "", "A400") else "XQC"
+
+
+def controls(path, stage, recovery=None, row=None, remaining=STEP_LIMIT):
     text = path.read_text()
-    algorithm = "YQC" if recovery == "scf" else "XQC"
-    scf = f"SCF=({algorithm},Tight,NoVarAcc,MaxCycle=512,MaxConventional=128)"
+    selected = algorithm(row or {})
+    if recovery == "scf":
+        selected = "XQC" if selected == "YQC" else "YQC"
+    scf = f"SCF=({selected},Tight,NoVarAcc,MaxCycle=512,MaxConventional=128)"
     text, count = re.subn(r"SCF=\([^\n)]*\)", scf, text, count=1)
     if count != 1:
         raise RuntimeError("Expected one SCF directive")
+    step = 5 if recovery == "pcm" else 10
     if stage == "opt":
+        if not 1 <= remaining <= STEP_LIMIT:
+            raise RuntimeError("Optimization step budget exhausted")
+        text = re.sub(r"\s*IOp\(1/152=\d+\)", "", text, flags=re.I)
         text, count = re.subn(
             r"Opt=\([^\n)]*\)",
-            "Opt=(Cartesian,CalcFC,Tight,MaxCycles=300"
-            + (",MaxStep=10" if recovery == "pcm" else "")
-            + ") IOp(1/152=300)",
+            f"Opt=(Redundant,CalcFC,Tight,MaxStep={step},MaxCycles={remaining}) "
+            f"IOp(1/152={remaining})",
             text,
             count=1,
         )
@@ -37,59 +43,146 @@ def controls(path, stage, recovery=None):
             raise RuntimeError("Expected one optimization directive")
     path.write_text(text)
     return {
+        "profile": PROFILE,
         "scf": scf,
-        "optimization_max_steps": 300 if stage == "opt" else None,
-        "max_step_bohr": 0.1 if recovery == "pcm" and stage == "opt" else None,
+        "optimization_max_steps": remaining if stage == "opt" else None,
+        "initial_trust_radius": step / 100 if stage == "opt" else None,
         "input_sha256": sha256(path),
     }
 
 
-def geometry_restart(source, log, dest, row):
-    text = log.read_text(errors="replace")
-    forces = list(re.finditer(r"^\s*Maximum Force\s+", text, re.MULTILINE))
-    if not forces:
-        if failure_kind(text) == "scf":
-            target = dest / "opt.gjf"
-            shutil.copy2(source, target)
-            return {
-                "mode": "Fresh wavefunction from validated initial geometry",
-                "source_log": str(log),
-                "source_log_sha256": sha256(log),
-                "input_sha256": sha256(target),
-            }
-        raise RuntimeError("No accepted geometry with evaluated forces to restart")
-    atoms = last_geometry(text[: forces[-1].start()])
-    data, numbers, _ = structure(ROOT / "structures" / (row["structure"] + ".cjson"))
-    if [a[0] for a in atoms] != numbers:
-        raise RuntimeError("Recovery geometry atom order differs")
-    issues = inspect_structure(data, numbers, [a[1:] for a in atoms])
-    if issues:
-        raise RuntimeError(
-            "Recovery geometry requires inspection: " + "; ".join(issues)
+def evaluated_frames(text):
+    frames = []
+    pattern = r"^\s*Maximum Force\s+(" + NUMBER + r")\s+(" + NUMBER + r")\s+(YES|NO)"
+    previous = 0
+    for index, match in enumerate(re.finditer(pattern, text, re.MULTILINE)):
+        prefix = text[previous : match.start()]
+        previous = match.end()
+        atoms = last_geometry(prefix)
+        energy = re.findall(r"SCF Done:.*?=\s*(" + NUMBER + r")", prefix)
+        rms = re.search(
+            r"RMS\s+Force\s+(" + NUMBER + r")", text[match.end() : match.end() + 500]
         )
-    prefix, body, basis = source.read_text().split("\n\n", 2)
-    basis = basis.split("\n\n", 1)[1]
-    coordinates = "\n".join(
-        SYMBOLS[a[0]] + " " + " ".join(f"{v:.10f}" for v in a[1:]) for a in atoms
+        if not atoms or not energy or not rms:
+            continue
+        item = dict(
+            step=index + 1,
+            geometry=atoms,
+            maximum_force=number(match[1]),
+            rms_force=number(rms[1]),
+            energy_hartree=number(energy[-1]),
+            log_offset=match.start(),
+        )
+        if all(math.isfinite(v) for a in atoms for v in a[1:]) and all(
+            math.isfinite(item[k])
+            for k in ("maximum_force", "rms_force", "energy_hartree")
+        ):
+            frames.append(item)
+    return frames
+
+
+def step_count(text):
+    return len(re.findall(r"^\s*Maximum Force\s+" + NUMBER, text, re.MULTILINE))
+
+
+def allocated_steps(text):
+    values = re.findall(r"maximum allowed number of steps=\s*(\d+)", text)
+    return int(values[0]) if values else None
+
+
+def optimization_limit(text):
+    values = re.findall(r"Step number\s+\d+\s+out of (?:a )?maximum of\s+(\d+)", text)
+    return int(values[-1]) if values else None
+
+
+def best_frame(text, row, root=ROOT):
+    data, numbers, _ = structure(root / "structures" / (row["structure"] + ".cjson"))
+    from provenance import geometry_issues
+
+    candidates = [
+        f
+        for f in evaluated_frames(text)
+        if [a[0] for a in f["geometry"]] == numbers
+        and not geometry_issues(f["geometry"], row, root)
+    ]
+    if not candidates:
+        raise RuntimeError("No structurally valid, fully evaluated restart geometry")
+    return min(
+        candidates,
+        key=lambda f: (
+            f["maximum_force"],
+            f["rms_force"],
+            f["energy_hartree"],
+            -f["step"],
+        ),
     )
-    target = dest / "opt.gjf"
-    target.write_text(
-        prefix
-        + "\n\n"
-        + body
-        + "\n\n"
-        + row["charge"]
-        + " 1\n"
-        + coordinates
-        + "\n\n"
-        + basis
+
+
+def geometry_restart(source, log, dest, row, root=ROOT):
+    text = log.read_text(errors="replace")
+    if not evaluated_frames(text):
+        if failure_kind(text) != "scf":
+            raise RuntimeError("No evaluated geometry available for recovery")
+        target = dest / "opt.gjf"
+        target.write_text(source.read_text())
+        record = {"mode": "Original geometry; fresh wavefunction", "step": 0}
+    else:
+        record = best_frame(text, row, root)
+        prefix, title, body = source.read_text().split("\n\n", 2)
+        basis = body.split("\n\n", 1)[1]
+        coordinates = "\n".join(
+            SYMBOLS[a[0]] + " " + " ".join(f"{v:.10f}" for v in a[1:])
+            for a in record["geometry"]
+        )
+        target = dest / "opt.gjf"
+        target.write_text(
+            prefix
+            + "\n\n"
+            + title
+            + "\n\n"
+            + row["charge"]
+            + " 1\n"
+            + coordinates
+            + "\n\n"
+            + basis
+        )
+        record["mode"] = "Best evaluated geometry; fresh Hessian and wavefunction"
+    record.update(
+        source_log=str(log), source_log_sha256=sha256(log), input_sha256=sha256(target)
     )
-    record = {
-        "mode": "Fresh optimization and wavefunction from last evaluated geometry",
-        "source_log": str(log),
-        "source_log_sha256": sha256(log),
-        "geometry": atoms,
-        "input_sha256": sha256(target),
-    }
-    (dest / "recovery-geometry.json").write_text(json.dumps(record, indent=2) + "\n")
+    write_json(dest / "recovery-geometry.json", record)
     return record
+
+
+def scientific_input(text):
+    prefix, rest = text.split("\n\n", 1)
+    body = rest if "GEOM=ALLCHECK" in prefix.upper() else rest.split("\n\n", 1)[1]
+    for directive in re.findall(r"^%[^\n]+", prefix, flags=re.MULTILINE):
+        if not re.fullmatch(
+            r"%(NProcShared=\d+|Mem=\d+GB|(?:Old)?Chk=[a-z]+\.chk)", directive, re.I
+        ):
+            raise ValueError("Unapproved Link0 directive")
+    for token in re.findall(r"(?:SCF|Opt)=\([^)]*\)|IOp\([^)]*\)", prefix, flags=re.I):
+        if token.upper().startswith("SCF"):
+            allowed = r"SCF=\((?:XQC|YQC),Tight(?:,NoVarAcc,MaxCycle=512,MaxConventional=128)?\)"
+        elif token.upper().startswith("OPT"):
+            allowed = r"Opt=\((?:Cartesian|Redundant),CalcFC,Tight(?:,MaxStep=(?:5|10))?,MaxCycles=(?:[1-9]\d?|[12]\d\d|300)\)"
+        else:
+            allowed = r"IOp\(1/152=(?:[1-9]\d?|[12]\d\d|300)\)"
+        if not re.fullmatch(allowed, token, re.I):
+            raise ValueError("Unapproved numerical directive: " + token)
+    prefix = re.sub(
+        r"^%(?:NProcShared|Mem)=[^\n]*\n?", "", prefix, flags=re.MULTILINE | re.I
+    )
+    prefix = re.sub(
+        r"SCF=\([^)]*\)|Opt=\([^)]*\)|IOp\(1/152=\d+\)", "", prefix, flags=re.I
+    )
+    return " ".join(prefix.split()).upper() + "\n" + " ".join(body.split())
+
+
+def compatible_inputs(old, new):
+    return scientific_input(old.read_text()) == scientific_input(new.read_text())
+
+
+def scientific_hash(path):
+    return hashlib.sha256(scientific_input(path.read_text()).encode()).hexdigest()

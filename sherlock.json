@@ -6,7 +6,7 @@
   },
   "group_hours": {
     "ions": 2,
-    "small": 48,
+    "small": 168,
     "large": 168
   },
   "failure_threshold": 2,
@@ -23,5 +23,9 @@
   "temperature_k": 298.15,
   "entropy_cutoff_cm": 100.0,
   "gaussian_revision": "B.01",
-  "backup_max_gb": 100
+  "backup_max_gb": 100,
+  "backup_warn_gb": 80,
+  "backup_stop_gb": 90,
+  "progress_snapshot_hours": 12,
+  "numerical_profile": "internal-20261005"
 }

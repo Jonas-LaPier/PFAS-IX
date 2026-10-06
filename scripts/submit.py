@@ -34,6 +34,7 @@ def array_command(cfg, group, rows, folder, snapshot, results):
         "--parsable",
         "--job-name=pfas_ix",
         "--nodes=1",
+        "--signal=B:USR1@1800",
         "--ntasks=1",
         "--cpus-per-task=" + row["cpus"],
         "--mem=" + row["mem_gb"] + "G",

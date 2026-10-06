@@ -1,309 +1,371 @@
 import argparse
+import fcntl
 import json
 import os
-import re
 import shutil
-import signal
-import subprocess
+import tempfile
 import time
 from pathlib import Path
 
-from backup import snapshot
+from backup import snapshot, storage_status
 from check_log import check
-from common import ROOT, input_hashes, manifest, sha256, stages, write_json
-from health import rebalance, update
-from numerics import controls, failure_kind, geometry_restart
-
-
-def restart_input(source, checkpoint, dest, row):
-    saved = dest / "recovery.chk"
-    shutil.copy2(checkpoint, saved)
-    formatted = dest / "recovery.fchk"
-    with (dest / "recovery_formchk.log").open("w") as log:
-        result = subprocess.run(
-            ["formchk", str(saved), str(formatted)],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
-    if result.returncode or not formatted.exists():
-        raise RuntimeError(
-            "Partial checkpoint is unreadable; restart optimization from its original input"
-        )
-    text = formatted.read_text()
-    for name, expected in [
-        ("Number of atoms", int(row["atoms"])),
-        ("Charge", int(row["charge"])),
-        ("Multiplicity", 1),
-    ]:
-        found = re.search(r"^" + name + r"\s+I\s+(-?\d+)\s*$", text, re.MULTILINE)
-        if not found or int(found[1]) != expected:
-            raise RuntimeError("Partial checkpoint " + name + " differs")
-    match = re.search(
-        r"^Atomic numbers\s+I\s+N=\s*(\d+)\s*\n(.*?)(?=^[A-Za-z]|\Z)",
-        text,
-        re.MULTILINE | re.DOTALL,
-    )
-    numbers = [int(n) for n in match[2].split()] if match else []
-    structure = json.loads(
-        (ROOT / "structures" / (row["structure"] + ".cjson")).read_text()
-    )
-    if numbers != structure["atoms"]["elements"]["number"]:
-        raise RuntimeError("Partial checkpoint atom order differs")
-    original = source.read_text()
-    prefix, _body, basis = original.split("\n\n", 2)
-    prefix = prefix.replace("%Chk=opt.chk", "%OldChk=recovery.chk\n%Chk=opt.chk")
-    prefix += " Geom=AllCheck Guess=Read"
-    basis = basis.split("\n\n", 1)[1]
-    target = dest / "opt.gjf"
-    target.write_text(prefix + "\n\n" + basis)
-    return {
-        "checkpoint_sha256": sha256(saved),
-        "input_sha256": sha256(target),
-        "source": str(checkpoint),
-        "mode": "New optimization from last checkpoint geometry; fresh Hessian",
-    }
+from common import ROOT, config, input_hashes, manifest, sha256, stages, write_json
+from health import update, rebalance
+from numerics import (
+    PROFILE,
+    STEP_LIMIT,
+    allocated_steps,
+    optimization_limit,
+    controls,
+    failure_kind,
+    geometry_restart,
+    step_count,
+)
+from provenance import checkpoint_readable, geometry_issues, source_audit
+from analyze import same_geometry
+from supervisor import Supervisor, InterruptedCalculation, telemetry
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("job")
-    p.add_argument("--receipt", type=Path, required=True)
-    p.add_argument("--results-root", type=Path, required=True)
-    a = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("job")
+    parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument("--results-root", type=Path, required=True)
+    args = parser.parse_args()
     if not os.environ.get("SLURM_JOB_ID"):
-        raise SystemExit("Run through Slurm, not on a login node.")
-    receipt = json.loads(a.receipt.read_text())
-    row = next(r for r in manifest() if r["job"] == a.job)
+        raise SystemExit("Run through Slurm, not on a login node")
+    receipt = json.loads(args.receipt.read_text())
+    row = next(r for r in manifest() if r["job"] == args.job)
+    expected = input_hashes(row)
+    if expected != receipt["input_hashes"][args.job]:
+        update(args.receipt, args.job, "Submission inputs differ", "provenance")
+        raise SystemExit("Submission inputs differ")
     if int(os.environ.get("SLURM_CPUS_PER_TASK", "0")) < int(row["cpus"]):
         raise SystemExit("Insufficient allocated CPUs")
-    expected = input_hashes(row)
-    if expected != receipt["input_hashes"][a.job]:
-        raise SystemExit("Submission input mismatch")
+    if update(args.receipt, args.job):
+        raise SystemExit("Campaign health stop blocks new work")
+    parent = args.results_root / args.job
+    parent.mkdir(parents=True, exist_ok=True)
+    lock = (parent / "workflow.lock").open("a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        update(args.receipt, args.job, "Duplicate active workflow", "provenance")
+        raise SystemExit("Duplicate active workflow")
     attempt = (
         os.environ["SLURM_JOB_ID"] + "_" + os.environ.get("SLURM_ARRAY_TASK_ID", "0")
     )
-    dest = a.results_root / a.job / attempt
-    dest.mkdir(parents=True, exist_ok=False)
-    env = os.environ.copy()
-    scratch = env.get("L_SCRATCH_JOB")
-    if not scratch:
-        raise SystemExit("Sherlock job-local scratch is unavailable")
-    temp = Path(scratch) / ("gaussian_" + a.job)
-    temp.mkdir(parents=True, exist_ok=True)
-    env["GAUSS_SCRDIR"] = str(temp)
-    meta = {
-        "job": a.job,
-        "attempt": attempt,
-        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "input_hashes": expected,
-        "package_hashes": receipt["package_hashes"],
-        "gaussian_module": env.get("DFT_GAUSSIAN_MODULE", ""),
-        "slurm_job_id": env["SLURM_JOB_ID"],
-        "status": "running",
-        "stage_results": {},
-        "log_hashes": {},
-        "checkpoint_hashes": {},
-    }
+    dest = parent / attempt
+    dest.mkdir(exist_ok=False)
+    meta = dict(
+        job=args.job,
+        attempt=attempt,
+        started=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        input_hashes=expected,
+        package_hashes=receipt["package_hashes"],
+        gaussian_module=os.environ.get("DFT_GAUSSIAN_MODULE", ""),
+        slurm_job_id=os.environ["SLURM_JOB_ID"],
+        status="running",
+        stage_results={},
+        log_hashes={},
+        checkpoint_hashes={},
+        executed_input_hashes={},
+        numerical_controls={},
+        numerical_profile=PROFILE,
+        recovery_plan=receipt.get("recovery_plan"),
+        optimization_steps=0,
+        recovery_segments=[],
+        retry_used=False,
+    )
+    supervisor = Supervisor(config().get("progress_snapshot_hours", 12) * 3600)
+    supervisor.install()
+    category = "setup"
+    scratch = None
+    backup_safe = True
+    exitcode = 1
 
     def save():
-        tmp = dest / "run.tmp"
-        tmp.write_text(json.dumps(meta, indent=2) + "\n")
-        tmp.replace(dest / "run.json")
+        write_json(dest / "run.json", meta)
 
-    def protect():
+    def protect(reason="stage completion"):
+        meta["snapshot_reason"] = reason
+        meta["interrupted_checkpoints"] = reason != "stage completion"
+        save()
         try:
-            record = snapshot(dest, a.receipt)
-            write_json(dest / "backup.json", {"status": "verified", "manifest": record})
-        except (OSError, ValueError, RuntimeError) as exc:
-            write_json(dest / "backup.json", {"status": "failed", "error": str(exc)})
-            update(a.receipt, a.job, "Backup failed: " + str(exc))
-            raise RuntimeError(
-                "Backup failed; original outputs retained: " + str(exc)
-            ) from exc
+            record = snapshot(dest, args.receipt)
+            write_json(
+                dest / "backup.json",
+                dict(
+                    status="verified",
+                    manifest=record,
+                    manifest_sha256=sha256(Path(record)),
+                    reason=reason,
+                ),
+            )
+        except Exception as exc:
+            write_json(dest / "backup.json", dict(status="failed", error=str(exc)))
+            update(args.receipt, args.job, "Backup failed: " + str(exc), "backup")
+            raise
 
     save()
-    resume = receipt.get("resume", {}).get(a.job)
-
-    def interrupted(signum, frame):
-        raise InterruptedError("Allocation interrupted by signal " + str(signum))
-
-    signal.signal(signal.SIGTERM, interrupted)
     try:
-        try:
-            rebalance(a.receipt)
-        except (OSError, ValueError, KeyError) as exc:
-            print("Concurrency update unavailable:", exc)
-        reusable = True
-        old = None
-        oldmeta = {}
-        if resume:
-            old = a.results_root / a.job / resume
-            oldmeta = json.loads((old / "run.json").read_text())
-            if oldmeta.get("input_hashes") != expected:
-                raise RuntimeError("Cannot resume different inputs")
+        category = "backup"
+        meta["storage"] = storage_status(new_start=True)
+        from recovery_plan import guard_allocations
+
+        guard_allocations(args.receipt)
+        rebalance(args.receipt)
+        category = "file_access"
+        scratch_base = (
+            Path(os.environ["SCRATCH"]).resolve(strict=True) / "PFAS-IX-gaussian"
+        )
+        scratch_base.mkdir(exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix=attempt + "-", dir=scratch_base))
+        env = dict(os.environ, GAUSS_SCRDIR=str(scratch))
+        meta["environment"] = telemetry(scratch)
+        save()
+        category = "provenance"
+        descriptor = receipt.get("sources", {}).get(args.job)
+        reusable = source_audit(descriptor, row) if descriptor else []
+        old = Path(descriptor["attempt"]) if descriptor else None
+        if descriptor:
+            meta["source"] = descriptor
+            meta["audited_reusable_stages"] = reusable
+        optimized = None
         for stage in stages(row):
             source = ROOT / row["input_dir"] / (stage + ".gjf")
-            shutil.copy2(source, dest / source.name)
-            if sha256(dest / source.name) != expected[stage]:
-                raise RuntimeError("Input changed: " + stage)
-            log = dest / (stage + ".log")
-            checkpoint = dest / (stage + ".chk")
-            reuse = False
-            if old and reusable:
-                oldlog = old / (stage + ".log")
-                oldchk = old / (stage + ".chk")
-                if (
-                    oldlog.exists()
-                    and oldchk.exists()
-                    and check(oldlog, stage, row)["valid"]
-                    and oldmeta.get("log_hashes", {}).get(stage) == sha256(oldlog)
-                    and oldmeta.get("checkpoint_hashes", {}).get(stage)
-                    == sha256(oldchk)
-                ):
-                    shutil.copy2(oldlog, log)
-                    shutil.copy2(oldchk, checkpoint)
-                    shutil.copy2(old / source.name, dest / source.name)
-                    reuse = True
-                if not reuse:
-                    reusable = False
-            if update(a.receipt, a.job):
-                meta["status"] = "held"
-                raise RuntimeError(
-                    "Campaign stopped after repeated setup or parser failures"
+            target, log, checkpoint = [
+                dest / (stage + suffix) for suffix in (".gjf", ".log", ".chk")
+            ]
+            shutil.copy2(source, target)
+            reuse = stage in reusable
+            if reuse:
+                for suffix in (".gjf", ".log", ".chk"):
+                    shutil.copy2(old / (stage + suffix), dest / (stage + suffix))
+                try:
+                    checkpoint_readable(
+                        checkpoint,
+                        row,
+                        dest,
+                        expected_geometry=check(log, stage, row)["geometry"],
+                    )
+                except RuntimeError as exc:
+                    reuse = False
+                    reusable = []
+                    meta.setdefault("rejected_checkpoint", {})[stage] = str(exc)
+                    for suffix in (".gjf", ".log", ".chk"):
+                        (dest / (stage + suffix)).rename(
+                            dest / (stage + "-unreadable" + suffix)
+                        )
+                    shutil.copy2(source, target)
+            if stage == "opt" and old and not reuse and (old / "opt.log").exists():
+                meta["optimization_restart"] = geometry_restart(
+                    source, old / "opt.log", dest, row
                 )
-            if stage == "opt" and old and not reuse and receipt.get("restart_opt"):
-                previous_text = (old / "opt.log").read_text(errors="replace")
-                previous_failure = failure_kind(previous_text)
-                if previous_failure in ["scf", "pcm"]:
-                    meta["optimization_restart"] = geometry_restart(
-                        source, old / "opt.log", dest, row
-                    )
-                elif (old / "opt.chk").is_file():
-                    meta["optimization_restart"] = restart_input(
-                        source, old / "opt.chk", dest, row
-                    )
-                else:
-                    raise RuntimeError("Optimization checkpoint missing")
-            else:
-                previous_failure = None
             meta["current_stage"] = stage
             save()
+            rc = 0
             if reuse:
                 meta.setdefault("reused_stages", {})[stage] = str(old)
-                if stage in oldmeta.get("numerical_controls", {}):
-                    meta.setdefault("numerical_controls", {})[stage] = oldmeta[
-                        "numerical_controls"
-                    ][stage]
-                rc = 0
             else:
-                meta.setdefault("numerical_controls", {})[stage] = controls(
-                    dest / source.name, stage, previous_failure
-                )
-                save()
+                recovery = None
                 while True:
-                    with (dest / source.name).open() as inp, log.open("w") as out:
-                        rc = subprocess.run(
-                            ["g16"],
-                            stdin=inp,
-                            stdout=out,
-                            stderr=subprocess.STDOUT,
-                            cwd=dest,
-                            env=env,
-                            check=False,
-                        ).returncode
-                    failed_kind = failure_kind(log.read_text(errors="replace"))
-                    if (
-                        stage != "opt"
-                        or check(log, stage, row)["valid"]
-                        or failed_kind not in ["scf", "pcm"]
-                        or previous_failure in ["scf", "pcm"]
-                    ):
+                    remaining = STEP_LIMIT - meta["optimization_steps"]
+                    numerical = controls(target, stage, recovery, row, remaining)
+                    meta["numerical_controls"][stage] = numerical
+                    meta["executed_input_hashes"][stage] = sha256(target)
+                    save()
+                    category = "unknown"
+                    verified_allocation = False
+                    last_observed = 0
+
+                    def observe():
+                        nonlocal verified_allocation, last_observed, category
+                        if stage == "opt" and not verified_allocation:
+                            with log.open(errors="replace") as stream:
+                                printed = allocated_steps(stream.read(2000000))
+                            if printed is not None:
+                                meta["actual_optimization_allocation"] = printed
+                                effective = optimization_limit(
+                                    log.read_text(errors="replace")
+                                )
+                                meta["effective_optimization_limit"] = effective
+                                if printed < remaining or (
+                                    effective is not None and effective != remaining
+                                ):
+                                    category = "provenance"
+                                    raise RuntimeError(
+                                        "Gaussian allocated "
+                                        + str(printed)
+                                        + " steps; expected "
+                                        + str(remaining)
+                                    )
+                                verified_allocation = effective is not None
+                                save()
+                        if time.monotonic() - last_observed >= 300:
+                            meta["environment"] = telemetry(scratch)
+                            meta["gaussian_process_group"] = supervisor.child.pid
+                            save()
+                            last_observed = time.monotonic()
+
+                    with target.open() as inp, log.open("w") as out:
+                        rc = supervisor.run(
+                            ["g16"], inp, out, dest, env, protect, observe
+                        )
+                    text = log.read_text(errors="replace")
+                    if stage == "opt":
+                        count = step_count(text)
+                        printed = allocated_steps(text)
+                        effective = optimization_limit(text)
+                        meta["optimization_steps"] += count
+                        meta["recovery_segments"].append(
+                            dict(
+                                steps=count,
+                                allocated=printed,
+                                effective_limit=effective,
+                                requested=remaining,
+                                input_sha256=sha256(target),
+                                log_sha256=sha256(log),
+                            )
+                        )
+                        if (
+                            count
+                            and (
+                                printed is None
+                                or printed < remaining
+                                or effective != remaining
+                            )
+                        ) or count > remaining:
+                            category = "provenance"
+                            raise RuntimeError(
+                                "Printed optimization allocation or total budget differs"
+                            )
+                    checked = check(log, stage, row)
+                    failure = failure_kind(text, rc)
+                    if not rc and checked["valid"]:
                         break
-                    history = {
-                        "failure": failed_kind,
-                        "log_sha256": sha256(log),
-                        "input_sha256": sha256(dest / source.name),
-                    }
-                    meta["optimization_recovery"] = history
-                    save()
-                    protect()
-                    for suffix in ["gjf", "log", "chk"]:
-                        original = dest / ("opt." + suffix)
-                        if original.exists():
-                            original.rename(dest / ("opt-before-recovery." + suffix))
-                    meta["optimization_restart"] = geometry_restart(
-                        source, dest / "opt-before-recovery.log", dest, row
+                    retry_allowed = not meta["retry_used"] and (
+                        failure == "scf" or (failure == "pcm" and stage == "opt")
                     )
-                    previous_failure = failed_kind
-                    meta["numerical_controls"][stage] = controls(
-                        dest / source.name, stage, failed_kind
-                    )
+                    if stage == "opt" and meta["optimization_steps"] >= STEP_LIMIT:
+                        retry_allowed = False
+                    if not retry_allowed:
+                        break
+                    meta["retry_used"] = True
+                    meta["recovery_cause"] = failure
                     save()
-            meta.setdefault("executed_input_hashes", {})[stage] = sha256(
-                dest / source.name
-            )
+                    protect("failed segment; checkpoint unvalidated")
+                    for suffix in (".gjf", ".log", ".chk"):
+                        path = dest / (stage + suffix)
+                        if path.exists():
+                            path.rename(dest / (stage + "-before-recovery" + suffix))
+                    if stage == "opt":
+                        meta["optimization_restart"] = geometry_restart(
+                            source, dest / (stage + "-before-recovery.log"), dest, row
+                        )
+                    else:
+                        shutil.copy2(source, target)
+                    recovery = failure
+                    save()
             checked = check(log, stage, row)
-            meta["stage_results"][stage] = {
-                k: v for k, v in checked.items() if k != "geometry"
-            }
+            meta["executed_input_hashes"][stage] = sha256(target)
             meta["log_hashes"][stage] = sha256(log)
             if checkpoint.exists():
                 meta["checkpoint_hashes"][stage] = sha256(checkpoint)
+            meta["stage_results"][stage] = {
+                k: v for k, v in checked.items() if k != "geometry"
+            }
             save()
-            protect()
             if rc or not checked["valid"]:
-                text = log.read_text(errors="replace")
-                if (
-                    not rc
-                    and "Normal termination of Gaussian" in text
-                    and checked["issues"]
-                    != ["Imaginary frequencies; minimum not accepted"]
-                ) or any(
-                    x in text
-                    for x in [
-                        "QPErr",
-                        "Error opening",
-                        "Permission denied",
-                        "command not found",
-                    ]
-                ):
-                    update(
-                        a.receipt, a.job, stage + ": " + "; ".join(checked["issues"])
-                    )
+                category = (
+                    failure_kind(log.read_text(errors="replace"), rc)
+                    or "scientific_review"
+                )
                 raise RuntimeError(stage + ": " + "; ".join(checked["issues"]))
-            if not checkpoint.exists() or not checkpoint.stat().st_size:
-                raise RuntimeError(stage + " checkpoint missing")
-        meta["status"] = "complete"
-        if shutil.which("formchk"):
-            with (dest / "formchk.log").open("w") as out:
-                meta["formchk_returncode"] = subprocess.run(
-                    ["formchk", "sp.chk", "sp.fchk"],
-                    cwd=dest,
-                    stdout=out,
-                    stderr=subprocess.STDOUT,
-                    check=False,
-                ).returncode
-    except Exception as exc:
-        if meta["status"] != "held":
-            meta["status"] = (
-                "interrupted" if isinstance(exc, InterruptedError) else "failed"
+            category = "scientific_review"
+            if row["kind"] != "ion":
+                issues = geometry_issues(checked["geometry"], row)
+                if issues:
+                    raise RuntimeError("; ".join(issues))
+                if stage == "opt":
+                    optimized = checked["geometry"]
+                elif not same_geometry(optimized, checked["geometry"]):
+                    category = "provenance"
+                    raise RuntimeError(
+                        "Stage geometry differs from verified optimization"
+                    )
+            category = "file_access"
+            checkpoint_readable(
+                checkpoint,
+                row,
+                dest,
+                expected_geometry=check(log, stage, row)["geometry"],
             )
-        if isinstance(exc, (FileNotFoundError, PermissionError)):
-            update(a.receipt, a.job, str(exc))
-        meta["error"] = str(exc)
-        raise
+            meta.setdefault("validated_checkpoints", {})[stage] = sha256(checkpoint)
+            save()
+            category = "backup"
+            protect()
+        meta["status"] = "complete"
+        exitcode = 0
+        update(args.receipt, args.job, resolved=True)
+    except BaseException as exc:
+        if isinstance(exc, InterruptedCalculation):
+            category = "interrupted"
+        meta.update(
+            status="interrupted" if category == "interrupted" else "failed",
+            error=str(exc),
+            terminal_failure=category,
+        )
+        update(args.receipt, args.job, str(exc), category)
+        if category == "file_access":
+            write_json(
+                dest / "support-evidence.json",
+                dict(
+                    job=args.job,
+                    allocation=meta["slurm_job_id"],
+                    environment=meta.get("environment"),
+                    input_hashes=meta["executed_input_hashes"],
+                    terminal_error=str(exc),
+                    stage=meta.get("current_stage"),
+                    log_tail=(
+                        log.read_text(errors="replace")[-16000:]
+                        if "log" in locals() and log.exists()
+                        else ""
+                    ),
+                    support_contacted=False,
+                ),
+            )
+        print(str(exc), flush=True)
     finally:
-        for checkpoint in dest.glob("*.chk"):
-            if checkpoint.stat().st_size:
-                meta["checkpoint_hashes"][checkpoint.stem] = sha256(checkpoint)
+        try:
+            supervisor.stop()
+        except Exception as exc:
+            backup_safe = False
+            meta["shutdown_error"] = str(exc)
+            meta["status"] = "failed"
+            update(args.receipt, args.job, str(exc), "backup")
+        if scratch:
+            meta["environment"] = telemetry(scratch)
         meta["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         save()
-        protect()
+        if backup_safe:
+            try:
+                protect("terminal " + meta["status"])
+            except Exception as exc:
+                meta.update(
+                    status="failed", terminal_failure="backup", backup_error=str(exc)
+                )
+                save()
+                exitcode = 1
+        else:
+            exitcode = 1
+        supervisor.restore()
         try:
-            rebalance(a.receipt)
-        except (OSError, ValueError, KeyError) as exc:
-            print("Concurrency update unavailable:", exc)
+            rebalance(args.receipt)
+        except Exception as exc:
+            print("Rebalance deferred:", str(exc))
+        lock.close()
+    raise SystemExit(exitcode)
 
 
 if __name__ == "__main__":

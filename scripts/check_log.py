@@ -32,20 +32,47 @@ def last_geometry(text):
     return atoms
 
 
+def terminal_failure(text, returncode=None):
+    normal = text.rfind("Normal termination of Gaussian")
+    fatal = list(
+        re.finditer(
+            r"Error termination[^\n]*|^ntrbks[^\n]*|Erroneous write[^\n]*|"
+            r"galloc:[^\n]*|No space left on device[^\n]*|Input/output error[^\n]*|"
+            r"Transport endpoint is not connected[^\n]*",
+            text,
+            re.MULTILINE,
+        )
+    )
+    if normal >= 0 and not any(m.start() > normal for m in fatal) and not returncode:
+        return None
+    end = fatal[-1].end() if fatal else len(text)
+    tail = text[max(0, normal) : end]
+    patterns = {
+        "file_access": r"ntrbks|Erroneous write|No space left on device|Input/output error|Transport endpoint is not connected|Error opening|Permission denied|Resource temporarily unavailable",
+        "memory": r"galloc:|out of memory",
+        "pcm": r"Inv3 failed in PCMMkU",
+        "scf": r"Convergence failure|No lower point found",
+        "steps": r"Number of steps exceeded",
+        "setup": r"QPErr|command not found",
+    }
+    events = [
+        (m.start(), kind)
+        for kind, pattern in patterns.items()
+        for m in re.finditer(pattern, tail, re.I)
+    ]
+    if events:
+        return max(events)[1]
+    if "l508.exe" in tail:
+        return "scf"
+    return "unfinished" if normal < 0 else "unknown"
+
+
 def check(path, stage, row):
     text = Path(path).read_text(errors="replace") if Path(path).exists() else ""
     issues = []
     if text.count("Normal termination of Gaussian") != 1:
         issues.append("Expected exactly one normal termination")
-    if any(
-        x in text
-        for x in [
-            "Error termination",
-            "Convergence failure",
-            "Erroneous write",
-            "galloc:",
-        ]
-    ):
+    if terminal_failure(text) not in (None, "unfinished"):
         issues.append("Gaussian error marker")
     tail = text.rsplit("Normal termination of Gaussian", 1)[-1]
     if text and ("SCF Done:" in tail or "Entering Gaussian" in tail):
@@ -54,9 +81,7 @@ def check(path, stage, row):
     method = (
         "M062X"
         if stage == "method"
-        else "PBE1PBE"
-        if stage in ("sp", "basis")
-        else "PBEPBE"
+        else "PBE1PBE" if stage in ("sp", "basis") else "PBEPBE"
     )
     energy = None
     if not energies or method not in energies[-1][0].upper().replace("-", ""):

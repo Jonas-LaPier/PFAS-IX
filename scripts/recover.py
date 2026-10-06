@@ -106,9 +106,11 @@ def select_rows(previous, queue):
     rows.sort(
         key=lambda r: (
             r["job"] not in resume,
-            {"free": 0, "counterion": 1, "complex": 2}.get(r["kind"], 3)
-            if r["job"] in resume
-            else 0,
+            (
+                {"free": 0, "counterion": 1, "complex": 2}.get(r["kind"], 3)
+                if r["job"] in resume
+                else 0
+            ),
             position[r["job"]],
         )
     )
@@ -117,9 +119,20 @@ def select_rows(previous, queue):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("submission")
+    parser.add_argument("submission", nargs="?")
+    parser.add_argument("--plan", type=Path)
+    parser.add_argument(
+        "--phase", choices=["validation", "warmup", "full"], default="validation"
+    )
     parser.add_argument("--submit", action="store_true")
     args = parser.parse_args()
+    if args.plan:
+        from recovery_plan import submit_plan
+
+        submit_plan(args.plan, args.phase, args.submit)
+        return
+    if not args.submission:
+        parser.error("Provide --plan PATH or an original submission")
     if Path(args.submission).name != args.submission:
         raise SystemExit("Use the original submission directory name")
     issues = validate()

@@ -113,6 +113,8 @@ def claim(receipt_path, task_id):
     task_id = str(int(task_id))
     receipt = json.loads(receipt_path.read_text())
     jobs = receipt["jobs"]
+    if update(receipt_path, "dispatch"):
+        raise RuntimeError("Campaign health stop blocks dispatch")
     if not 0 <= int(task_id) < len(jobs) or len(set(jobs)) != len(jobs):
         raise ValueError("Invalid array task or job list")
     folder = receipt_path.parent
@@ -137,7 +139,36 @@ def claim(receipt_path, task_id):
         return claims[task_id]
 
 
-def update(receipt_path, job, failure=None):
+def hold_recovery(receipt):
+    if not receipt.get("phase_record"):
+        return []
+    from recovery_plan import phase_paths
+
+    phase = json.loads(Path(receipt["phase_record"]).read_text())
+    plan = Path(phase["plan"])
+    errors = []
+    for name in ("validation", "warmup", "full"):
+        path = phase_paths(plan, name)
+        if not path.exists():
+            continue
+        record = json.loads(path.read_text())
+        if record["plan_sha256"] != receipt["recovery_plan"]:
+            raise RuntimeError("Phase provenance differs during health stop")
+        for identifier in record["arrays"].values():
+            if not identifier.isdigit():
+                raise RuntimeError("Invalid array identifier")
+            result = subprocess.run(
+                ["scontrol", "hold", identifier],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode:
+                errors.append(result.stderr.strip())
+    return errors
+
+
+def update(receipt_path, job, failure=None, category=None, resolved=False):
     receipt = json.loads(Path(receipt_path).read_text())
     folder = Path(receipt.get("health_dir", str(Path(receipt_path).parent)))
     folder.mkdir(parents=True, exist_ok=True)
@@ -149,19 +180,43 @@ def update(receipt_path, job, failure=None):
             if path.exists()
             else {"failures": {}, "stopped": False}
         )
+        was_stopped = state["stopped"]
+        if resolved:
+            state["failures"].pop(job, None)
+            state.setdefault("categories", {}).pop(job, None)
+            write_json(path, state)
         if failure:
             state["failures"][job] = failure
-            if len(state["failures"]) >= config()["failure_threshold"]:
+            state.setdefault("categories", {})[job] = category or "setup"
+            if (
+                category in ("backup", "provenance", "file_access", "setup", "memory")
+                or category is None
+            ):
+                state["stopped"] = True
+            numerical = sum(
+                value
+                in ("scf", "pcm", "steps", "unknown", "unfinished", "scientific_review")
+                for value in state.get("categories", {}).values()
+            )
+            if numerical >= config()["failure_threshold"]:
                 state["stopped"] = True
             temp = folder / "health.tmp"
             temp.write_text(json.dumps(state, indent=2) + "\n")
             temp.replace(path)
+        if state["stopped"] and not was_stopped:
+            state["hold_errors"] = hold_recovery(receipt)
+            write_json(path, state)
         return state["stopped"]
 
 
 def rebalance(receipt_path):
     receipt_path = Path(receipt_path)
     receipt = json.loads(receipt_path.read_text())
+    if receipt.get("recovery_plan"):
+        from recovery_plan import rebalance_phase
+
+        rebalance_phase(receipt_path)
+        return
     if receipt.get("previous_arrays"):
         rebalance_transition(receipt_path, receipt)
         return

@@ -19,4 +19,4 @@ command -v g16
 command -v formchk
 export DFT_GAUSSIAN_MODULE=gaussian/g16.B01
 trap - ERR
-python3 scripts/run_job.py "$job" --receipt "$receipt" --results-root "$results_root"
+exec python3 scripts/run_job.py "$job" --receipt "$receipt" --results-root "$results_root"
