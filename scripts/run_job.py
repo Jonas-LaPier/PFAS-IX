@@ -20,6 +20,7 @@ from numerics import (
     failure_kind,
     geometry_restart,
     step_count,
+    audit_estimated_hessian,
 )
 from provenance import checkpoint_readable, geometry_issues, input_model, source_audit
 from analyze import same_geometry
@@ -132,6 +133,11 @@ def main():
             meta["source"] = descriptor
             meta["audited_reusable_stages"] = reusable
         continuation = receipt.get("continuations", {}).get(args.job)
+        initial_hessian = receipt.get("optimization_hessian", {}).get(args.job, "analytic")
+        if initial_hessian == "estimated" and (
+            not continuation or continuation.get("kind") != "pcm_estimated_hessian"
+        ):
+            raise RuntimeError("Estimated Hessian requires audited PCM continuation")
         if continuation:
             prior = Path(continuation["attempt"])
             if sha256(prior / "run.json") != continuation["meta_sha256"]:
@@ -144,17 +150,34 @@ def main():
                 raise RuntimeError(
                     "Continuation requires a terminal attempt of this workflow"
                 )
-            failed_log = prior / "opt-before-recovery.log"
             evidence_path = Path(receipt["numerical_evidence"])
             if (
-                previous["optimization_steps"] != 0
-                or len(previous["recovery_segments"]) != 1
-                or sha256(failed_log) != previous["recovery_segments"][0]["log_sha256"]
-                or failure_kind(failed_log.read_text(errors="replace")) != "pcm"
-                or sha256(evidence_path) != receipt["numerical_evidence_sha256"]
+                sha256(evidence_path) != receipt["numerical_evidence_sha256"]
                 or json.loads(evidence_path.read_text())["status"] != "passed"
             ):
                 raise RuntimeError("PCM continuation evidence differs")
+            if continuation.get("kind") == "pcm_estimated_hessian":
+                if initial_hessian != "estimated":
+                    raise RuntimeError("Estimated Hessian correction was not selected")
+                previous = audit_estimated_hessian(
+                    prior,
+                    continuation,
+                    row,
+                    ROOT / row["input_dir"] / "opt.gjf",
+                    evidence_path,
+                )
+            elif continuation.get("kind", "pcm_solver") == "pcm_solver":
+                failed_log = prior / "opt-before-recovery.log"
+                if (
+                    previous["optimization_steps"] != 0
+                    or len(previous["recovery_segments"]) != 1
+                    or sha256(failed_log)
+                    != previous["recovery_segments"][0]["log_sha256"]
+                    or failure_kind(failed_log.read_text(errors="replace")) != "pcm"
+                ):
+                    raise RuntimeError("PCM continuation evidence differs")
+            else:
+                raise RuntimeError("Unknown continuation correction")
             meta["optimization_steps"] = previous["optimization_steps"]
             meta["recovery_segments"] = previous["recovery_segments"]
             meta["retry_used"] = True
@@ -209,6 +232,7 @@ def main():
                         pcm_solver=receipt.get("pcm_solver", {}).get(args.job)
                         == "iterative"
                         or meta.get("recovery_cause") == "pcm",
+                        initial_hessian=initial_hessian,
                     )
                     if input_model(target.read_text(), stage) != input_model(
                         source.read_text(), stage

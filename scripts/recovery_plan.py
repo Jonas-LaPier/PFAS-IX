@@ -353,6 +353,17 @@ def submit_plan(path, phase, execute=False):
     print("Recovery receipt:", destination)
 
 
+def replacement_arrays(replacement):
+    path = Path(replacement["record"])
+    if sha256(path) != replacement["record_sha256"]:
+        raise RuntimeError("Replacement allocation record changed")
+    record = json.loads(path.read_text())
+    arrays = set(record["arrays"].values())
+    for child in record.get("replacements", {}).values():
+        arrays.update(replacement_arrays(child))
+    return arrays
+
+
 def guard_allocations(receipt_path):
     receipt = json.loads(Path(receipt_path).read_text())
     if not receipt.get("phase_record"):
@@ -366,10 +377,7 @@ def guard_allocations(receipt_path):
         if path.exists():
             arrays.update(json.loads(path.read_text())["arrays"].values())
         for replacement in replacement_records(plan_path, name).values():
-            record_path = Path(replacement["record"])
-            if sha256(record_path) != replacement["record_sha256"]:
-                raise RuntimeError("Replacement allocation record changed")
-            arrays.update(json.loads(record_path.read_text())["arrays"].values())
+            arrays.update(replacement_arrays(replacement))
     output = subprocess.check_output(
         ["squeue", "--array", "-h", "-u", os.environ["USER"], "-o", "%F|%T|%C|%j"],
         text=True,

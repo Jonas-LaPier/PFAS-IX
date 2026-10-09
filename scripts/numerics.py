@@ -1,6 +1,8 @@
 import hashlib
 import re
 import math
+import json
+from pathlib import Path
 
 from check_log import NUMBER, last_geometry, number, terminal_failure
 from common import ROOT, sha256, write_json
@@ -19,8 +21,16 @@ def algorithm(row):
 
 
 def controls(
-    path, stage, recovery=None, row=None, remaining=STEP_LIMIT, pcm_solver=False
+    path,
+    stage,
+    recovery=None,
+    row=None,
+    remaining=STEP_LIMIT,
+    pcm_solver=False,
+    initial_hessian="analytic",
 ):
+    if initial_hessian not in ("analytic", "estimated"):
+        raise RuntimeError("Unknown initial Hessian selection")
     text = path.read_text()
     selected = algorithm(row or {})
     if recovery == "scf":
@@ -29,14 +39,16 @@ def controls(
     text, count = re.subn(r"SCF=\([^\n)]*\)", scf, text, count=1)
     if count != 1:
         raise RuntimeError("Expected one SCF directive")
-    step = 5 if recovery == "pcm" else 10
+    step = 5 if recovery == "pcm" or initial_hessian == "estimated" else 10
     if stage == "opt":
         if not 1 <= remaining <= STEP_LIMIT:
             raise RuntimeError("Optimization step budget exhausted")
+        hessian = "CalcFC," if initial_hessian == "analytic" else ""
         text = re.sub(r"\s*IOp\(1/152=\d+\)", "", text, flags=re.I)
         text, count = re.subn(
             r"Opt=\([^\n)]*\)",
-            f"Opt=(Redundant,CalcFC,Tight,MaxStep={step},MaxCycles={remaining}) "
+            f"Opt=(Redundant,{hessian}"
+            f"Tight,MaxStep={step},MaxCycles={remaining}) "
             f"IOp(1/152={remaining})",
             text,
             count=1,
@@ -52,8 +64,71 @@ def controls(
         "pcm_solver": "iterative" if "Iterative QConv=VeryTight" in text else "default",
         "optimization_max_steps": remaining if stage == "opt" else None,
         "initial_trust_radius": step / 100 if stage == "opt" else None,
+        "initial_hessian": initial_hessian if stage == "opt" else None,
         "input_sha256": sha256(path),
     }
+
+
+def audit_estimated_hessian(prior, continuation, row, source, evidence_path):
+    from backup import verify_snapshot
+    from provenance import input_model
+
+    previous = json.loads((prior / "run.json").read_text())
+    failed = prior / "opt.log"
+    executed = prior / "opt.gjf"
+    text = failed.read_text(errors="replace")
+    executed_text = executed.read_text()
+    segments = previous.get("recovery_segments", [])
+    if (
+        previous.get("status") != "failed"
+        or previous.get("terminal_failure") != "pcm"
+        or previous.get("job") != row["job"]
+        or previous.get("package_hashes") != continuation["package_hashes"]
+        or previous.get("optimization_steps") != 0
+        or step_count(text) != 0
+        or re.search(r"SCF Done:", text)
+        or not segments
+        or segments[-1]["log_sha256"] != sha256(failed)
+        or segments[-1]["input_sha256"] != sha256(executed)
+        or "Force inversion solution in PCM." not in text
+        or "Solution method      : Matrix inversion." not in text
+        or "Inv3 failed in PCMMkU." not in text
+        or "CalcFC" not in executed_text
+        or "Iterative QConv=VeryTight" not in executed_text
+        or input_model(executed_text, "opt")
+        != input_model(source.read_text(), "opt")
+    ):
+        raise RuntimeError("Estimated Hessian requires the verified zero-step PCM failure")
+    backup = json.loads((prior / "backup.json").read_text())
+    if backup["status"] != "verified":
+        raise RuntimeError("Failed PCM attempt was not preserved")
+    names = ["run.json", "opt.log", "opt.gjf"]
+    stored = verify_snapshot(backup["manifest"], ["attempt/" + n for n in names])
+    if any(stored["files"]["attempt/" + n] != sha256(prior / n) for n in names):
+        raise RuntimeError("Preserved PCM failure differs")
+    evidence = json.loads(evidence_path.read_text())
+    if (
+        evidence.get("status") != "passed"
+        or not 0 <= evidence["energy_delta_hartree"] < 1e-7
+        or not 0 <= evidence["max_force_delta_au"] < 1e-6
+    ):
+        raise RuntimeError("PCM solver comparison did not pass")
+    receipt_path = Path(evidence["receipt"])
+    if sha256(receipt_path) != evidence["receipt_sha256"]:
+        raise RuntimeError("PCM diagnostic receipt changed")
+    case = receipt_path.parent / "PCy3_iterative"
+    tested = evidence["cases"]["PCy3_iterative"]
+    force_text = (case / "force.log").read_text()
+    if (
+        sha256(case / "force.gjf") != tested["input_sha256"]
+        or sha256(case / "force.log") != tested["log_sha256"]
+        or "Solution method      : Iterative solution." not in force_text
+        or failure_kind(force_text) is not None
+        or executed_text.split("\n\n", 2)[2].split("\n\n", 1)[0]
+        != (case / "force.gjf").read_text().split("\n\n", 2)[2].split("\n\n", 1)[0]
+    ):
+        raise RuntimeError("PCM gradient evidence or starting geometry differs")
+    return previous
 
 
 def evaluated_frames(text):
@@ -258,7 +333,7 @@ def scientific_input(text):
         if token.upper().startswith("SCF"):
             allowed = r"SCF=\((?:XQC|YQC),Tight(?:,NoVarAcc,MaxCycle=512,MaxConventional=128)?\)"
         elif token.upper().startswith("OPT"):
-            allowed = r"Opt=\((?:Cartesian|Redundant),CalcFC,Tight(?:,MaxStep=(?:5|10))?,MaxCycles=(?:[1-9]\d?|[12]\d\d|300)\)"
+            allowed = r"Opt=\((?:(?:Cartesian|Redundant),CalcFC,Tight(?:,MaxStep=(?:5|10))?|Redundant,Tight,MaxStep=5),MaxCycles=(?:[1-9]\d?|[12]\d\d|300)\)"
         else:
             allowed = r"IOp\(1/152=(?:[1-9]\d?|[12]\d\d|300)\)"
         if not re.fullmatch(allowed, token, re.I):
