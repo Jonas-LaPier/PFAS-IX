@@ -131,6 +131,39 @@ def audit_estimated_hessian(prior, continuation, row, source, evidence_path):
     return previous
 
 
+def cartesian_forces(text, atoms):
+    blocks = list(re.finditer(
+        r"Center\s+Atomic\s+Forces \(Hartrees/Bohr\).*?\n\s*-+\n"
+        r"(.*?)\n\s*-+",
+        text,
+        re.DOTALL,
+    ))
+    if not blocks:
+        raise ValueError("Missing evaluated Cartesian forces")
+    rows = [line.split() for line in blocks[-1][1].splitlines()]
+    if len(rows) != len(atoms) or any(len(row) != 5 for row in rows):
+        raise ValueError("Incomplete Cartesian force block")
+    if [int(row[1]) for row in rows] != [a[0] for a in atoms]:
+        raise ValueError("Cartesian force atom order differs")
+    vectors = [[number(v) for v in row[2:]] for row in rows]
+    if not all(math.isfinite(v) for row in vectors for v in row):
+        raise ValueError("Nonfinite Cartesian force")
+    return {
+        "cartesian_forces": vectors,
+        "cartesian_max_atom_force": max(math.sqrt(sum(v*v for v in row)) for row in vectors),
+        "cartesian_rms_force": math.sqrt(sum(v*v for row in vectors for v in row) / (3*len(vectors))),
+    }
+
+
+def frame_rank(frame):
+    return (
+        frame["cartesian_max_atom_force"],
+        frame["cartesian_rms_force"],
+        frame["energy_hartree"],
+        -frame["step"],
+    )
+
+
 def evaluated_frames(text):
     frames = []
     pattern = r"^\s*Maximum Force\s+(" + NUMBER + r")\s+(" + NUMBER + r")\s+(YES|NO)"
@@ -153,6 +186,10 @@ def evaluated_frames(text):
             energy_hartree=number(energy[-1]),
             log_offset=match.start(),
         )
+        try:
+            item.update(cartesian_forces(prefix, atoms))
+        except ValueError:
+            item["cartesian_force_unavailable"] = True
         if all(math.isfinite(v) for a in atoms for v in a[1:]) and all(
             math.isfinite(item[k])
             for k in ("maximum_force", "rms_force", "energy_hartree")
@@ -184,18 +221,11 @@ def best_frame(text, row, root=ROOT):
         for f in evaluated_frames(text)
         if [a[0] for a in f["geometry"]] == numbers
         and not geometry_issues(f["geometry"], row, root)
+        and not f.get("cartesian_force_unavailable")
     ]
     if not candidates:
         raise RuntimeError("No structurally valid, fully evaluated restart geometry")
-    return min(
-        candidates,
-        key=lambda f: (
-            f["maximum_force"],
-            f["rms_force"],
-            f["energy_hartree"],
-            -f["step"],
-        ),
-    )
+    return min(candidates, key=frame_rank)
 
 
 def geometry_restart(
@@ -247,13 +277,7 @@ def geometry_restart(
     else:
         record, selected_log, _ = min(
             candidates,
-            key=lambda item: (
-                item[0]["maximum_force"],
-                item[0]["rms_force"],
-                item[0]["energy_hartree"],
-                -item[2],
-                -item[0]["step"],
-            ),
+            key=lambda item: (*frame_rank(item[0])[:3], -item[2], -item[0]["step"]),
         )
         prefix, title, body = source.read_text().split("\n\n", 2)
         basis = body.split("\n\n", 1)[1]
