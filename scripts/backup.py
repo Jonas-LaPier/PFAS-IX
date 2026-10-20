@@ -43,6 +43,28 @@ def quota_bytes(text):
     return max(0, limit - used - factors[match[2]])
 
 
+def group_quota():
+    errors = []
+    started = time.monotonic()
+    for index, timeout in enumerate((30, 45, 60)):
+        try:
+            result = subprocess.run(
+                ["sh_quota"], capture_output=True, text=True, check=True, timeout=timeout
+            )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+            errors.append(str(exc))
+            if index == 2:
+                raise RuntimeError("Group quota unavailable after three attempts: " + "; ".join(errors)) from exc
+            time.sleep((2, 5)[index])
+        else:
+            return {
+                "available_bytes": quota_bytes(result.stdout),
+                "attempts": index + 1,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "transient_errors": errors,
+            }
+
+
 def storage_status(root=ROOT, new_start=False):
     target = destination(root)
     target.mkdir(parents=True, exist_ok=True)
@@ -53,14 +75,13 @@ def storage_status(root=ROOT, new_start=False):
         else 0
     )
     cfg = config(root)
-    quota = subprocess.run(
-        ["sh_quota"], capture_output=True, text=True, check=True, timeout=30
-    )
-    free = min(quota_bytes(quota.stdout), shutil.disk_usage(target).free)
+    quota = group_quota()
+    free = min(quota["available_bytes"], shutil.disk_usage(target).free)
     status = {
         "used_bytes": usage,
         "group_available_bytes": free,
         "warning": usage >= cfg.get("backup_warn_gb", 80) * 1024**3,
+        "quota": quota,
     }
     if new_start and (
         usage >= cfg.get("backup_stop_gb", 90) * 1024**3 or free < 2 * 1024**3
@@ -108,7 +129,8 @@ def snapshot(attempt, receipt, root=ROOT):
         mapping = {name: sha256(p) for name, p in files.items()}
         usage = sum(p.stat().st_size for p in objects.iterdir() if p.is_file())
         limit = config(root)["backup_max_gb"] * 1024**3
-        available = storage_status(root)["group_available_bytes"]
+        storage = storage_status(root)
+        available = storage["group_available_bytes"]
         needed = sum(
             source.stat().st_size
             for name, source in files.items()
@@ -148,7 +170,11 @@ def snapshot(attempt, receipt, root=ROOT):
         folders.mkdir(parents=True, exist_ok=True)
         record = folders / (str(time.time_ns()) + ".json")
         write_json(
-            record, {"files": mapping, "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+            record, {
+                "files": mapping,
+                "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "storage": storage,
+            }
         )
         return str(record)
 

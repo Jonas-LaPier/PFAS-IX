@@ -22,6 +22,52 @@ class PrerequisiteFailed(RuntimeError):
     pass
 
 
+class ComparisonFailed(RuntimeError):
+    def __init__(self, result):
+        self.result = result
+        super().__init__("Matched energy/force repeat requires review: " +
+                         str(result["reference_energy_delta"]) + ", " +
+                         str(result["reference_max_force_delta"]))
+
+
+def validate_repeat_reference(case, inp):
+    evidence = case.get("comparison_source")
+    if not evidence:
+        raise RuntimeError("A repeat comparison requires verified identical-input evidence")
+    prior = Path(evidence["attempt"])
+    record = Path(evidence["backup_manifest"])
+    if sha256(record) != evidence["backup_manifest_sha256"]:
+        raise RuntimeError("Comparison backup manifest changed")
+    files = ("calc.gjf", "calc.log", "run.json")
+    saved = verify_snapshot(record, ["attempt/" + name for name in files])
+    for name in files:
+        digest = sha256(prior / name)
+        if digest != evidence["files"][name] or saved["files"]["attempt/" + name] != digest:
+            raise RuntimeError("Comparison evidence differs from its backup")
+    previous = json.loads((prior / "run.json").read_text())
+    if (previous.get("kind") != "force" or previous.get("job") != case["job"]
+            or previous.get("input_sha256") != sha256(prior / "calc.gjf")
+            or previous.get("log_sha256") != sha256(prior / "calc.log")):
+        raise RuntimeError("Comparison run provenance differs")
+    if previous["status"] != "passed" and not (
+        previous["status"] == "failed"
+        and previous.get("error", "").startswith("Energy/force comparison requires review:")
+        and previous.get("terminal_failure") is None
+        and not previous.get("backup_error") and not previous.get("shutdown_error")
+    ):
+        raise RuntimeError("Comparison source has an unresolved calculation failure")
+    text = (prior / "calc.log").read_text()
+    if terminal_failure(text) is not None or inp.read_bytes() != (prior / "calc.gjf").read_bytes():
+        raise RuntimeError("Repeat comparison requires normal termination and identical executed inputs")
+    result = force_result(text, {"geometry": case["geometry"]})
+    expected = {key: result[key] for key in ("energy_hartree", "cartesian_forces")}
+    if case["reference"] != expected:
+        raise RuntimeError("Comparison values differ from the verified log")
+    version = re.search(r"Gaussian 16:\s+([^\n]+)", text)
+    if not version or case.get("reference_version") != version[1].strip():
+        raise RuntimeError("Comparison Gaussian version differs")
+
+
 def make_input(source, atoms, kind, precise=True, reuse_guess=False, reuse_hessian=False):
     if kind not in ("force", "opt", "hessian"):
         raise ValueError("Unknown bounded calculation")
@@ -74,6 +120,10 @@ def validate_case(case, folder, receipt):
     inp = folder / case["name"] / "calc.gjf"
     if inp.read_text() != expected or sha256(inp) != case["input_sha256"]:
         raise RuntimeError("Executed input differs from bounded plan")
+    if case.get("reference"):
+        if case["kind"] != "force":
+            raise RuntimeError("Repeat comparison is only supported for fixed-geometry forces")
+        validate_repeat_reference(case, inp)
     old = Path(case["source_attempt"])
     backup = Path(case["source_backup_manifest"])
     if sha256(backup) != case["source_backup_sha256"]:
@@ -114,18 +164,35 @@ def force_result(text, case):
     energies = re.findall(r"SCF Done:[^\n]*=\s*([-+\d.DEde]+)", text)
     if not energies or len(geometry) != len(case["geometry"]):
         raise RuntimeError("Incomplete energy or geometry")
+    if [a[0] for a in geometry] != [a[0] for a in case["geometry"]]:
+        raise RuntimeError("Fixed geometry atom identities differ")
     if max(abs(a-b) for x,y in zip(geometry,case["geometry"]) for a,b in zip(x[1:],y[1:])) > 2e-6:
         raise RuntimeError("Fixed geometry moved")
     result = dict(energy_hartree=number(energies[-1]), **forces)
+    if not math.isfinite(result["energy_hartree"]):
+        raise RuntimeError("Nonfinite energy")
+    historical = case.get("historical_reference")
+    if historical:
+        result["historical_energy_delta"] = abs(result["energy_hartree"] - historical["energy_hartree"])
+        result["historical_comparison"] = "Different numerical settings or reconstructed coordinates; not an exact-repeat test"
     reference = case.get("reference")
     if reference:
+        if case.get("reference_version"):
+            version = re.search(r"Gaussian 16:\s+([^\n]+)", text)
+            if not version or version[1].strip() != case["reference_version"]:
+                raise RuntimeError("Repeat Gaussian version differs")
         if len(reference["cartesian_forces"]) != len(geometry):
             raise RuntimeError("Reference force size differs")
+        if any(len(row) != 3 for row in reference["cartesian_forces"]):
+            raise RuntimeError("Incomplete reference force vector")
+        if not all(math.isfinite(v) for row in reference["cartesian_forces"] for v in row) or not math.isfinite(reference["energy_hartree"]):
+            raise RuntimeError("Nonfinite comparison reference")
         delta = abs(result["energy_hartree"] - reference["energy_hartree"])
         df = max(abs(a-b) for x,y in zip(forces["cartesian_forces"],reference["cartesian_forces"]) for a,b in zip(x,y))
         result.update(reference_energy_delta=delta, reference_max_force_delta=df)
         if delta > 1e-7 or df > 1e-6:
-            raise RuntimeError(f"Energy/force comparison requires review: {delta}, {df}")
+            raise ComparisonFailed(result)
+        result["repeat_comparison"] = "passed"
     return result
 
 
@@ -146,6 +213,7 @@ def run(folder, name):
                 slurm_job_id=os.environ["SLURM_JOB_ID"], started=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 receipt_sha256=sha256(receipt_path), scientific_workflow_complete=False)
     supervisor = Supervisor(interval=4*3600)
+    supervisor.next_snapshot = time.monotonic() + 300
     supervisor.install()
     scratch = None
     safe = True
@@ -164,6 +232,7 @@ def run(folder, name):
             write_json(folder / ("halt-" + name + ".json"), dict(case=name, category="backup", error=str(exc)))
             raise
         write_json(dest / "backup.json", dict(status="verified", manifest=str(saved), manifest_sha256=sha256(saved), reason=reason))
+        print(json.dumps(dict(case=name, event="backup_verified", reason=reason, manifest=str(saved))), flush=True)
 
     try:
         save()
@@ -191,6 +260,7 @@ def run(folder, name):
         scratch = Path(tempfile.mkdtemp(prefix="bounded-" + name + "-", dir=base))
         meta.update(environment=telemetry(scratch), input_sha256=sha256(inp))
         save()
+        print(json.dumps(dict(case=name, event="gaussian_started", input_sha256=sha256(inp))), flush=True)
         deadline = time.monotonic() + case["wall_seconds"]
         log = dest / "calc.log"
 
@@ -226,6 +296,8 @@ def run(folder, name):
         meta.update(status="bounded_stop", error=str(exc), checkpoint_unvalidated=True)
     except PrerequisiteFailed as exc:
         meta.update(status="blocked", error=str(exc))
+    except ComparisonFailed as exc:
+        meta.update(status="review_required", error=str(exc), result=exc.result)
     except BaseException as exc:
         meta.update(status="failed", error=str(exc))
         if meta.get("terminal_failure") == "file_access":
@@ -256,6 +328,7 @@ def run(folder, name):
         else:
             code = 1
         supervisor.restore()
+        print(json.dumps(dict(case=name, event="finished", status=meta["status"], error=meta.get("error"))), flush=True)
     return code
 
 
